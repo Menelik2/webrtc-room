@@ -1,0 +1,17 @@
+{
+  "name": "webrtc-room",
+  "version": "2.1.1",
+  "private": true,
+  "description": "mediasoup SFU WebRTC room — client + server",
+  "scripts": {
+    "validate": "node scripts/validate.js",
+    "validate:server": "node --check server/server.js",
+    "validate:client": "node scripts/validate-client.js",
+    "test": "npm run validate",
+    "start": "npm --prefix server start",
+    "install:server": "npm --prefix server install"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

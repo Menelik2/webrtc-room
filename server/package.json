@@ -1,0 +1,19 @@
+{
+  "name": "webrtc-sfu-server",
+  "version": "2.1.1",
+  "description": "mediasoup SFU + WebSocket signaling for WebRTC rooms",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "validate": "node --check server.js",
+    "test": "npm run validate"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mediasoup": "^3.14.14",
+    "ws": "^8.17.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
