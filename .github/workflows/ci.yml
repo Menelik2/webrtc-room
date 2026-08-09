@@ -1,0 +1,20 @@
+name: CI and Deploy
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+env:
+  NODE_VERSION: "20"
+jobs:
+  validate:
+    name: Build validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Validate entries
+        run: node scripts/validate.js || node --check server/server.js
