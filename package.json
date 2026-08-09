@@ -1,0 +1,10 @@
+{
+  "name": "webrtc-room",
+  "version": "2.1.1",
+  "private": true,
+  "scripts": {
+    "validate": "node scripts/validate.js",
+    "start": "npm --prefix server start"
+  },
+  "engines": { "node": ">=18" }
+}
