@@ -1,0 +1,27 @@
+# SFU (mediasoup) + optional coturn
+#
+# Production: set ANNOUNCED_IP to your public IP so clients get reachable ICE candidates.
+#
+# Ports:
+#   3000/tcp           – HTTP + WebSocket signaling + static client
+#   40000-49999/udp+tcp – mediasoup RTC (media)
+#   3478, 5349, 49152-49200 – coturn (optional)
+
+services:
+  sfu:
+    image: node:20-bookworm
+    working_dir: /app
+    volumes:
+      - ./server:/app
+      - ./client:/client
+    command: sh -c "npm install && node server.js"
+    ports:
+      - "3000:3000"
+      - "40000-40100:40000-40100/udp"
+      - "40000-40100:40000-40100/tcp"
+    environment:
+      - PORT=3000
+      - ANNOUNCED_IP=${ANNOUNCED_IP:-}
+      - MEDIASOUP_MIN_PORT=40000
+      - MEDIASOUP_MAX_PORT=40100
+    restart: unless-stopped
