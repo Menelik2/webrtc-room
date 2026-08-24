@@ -1,6 +1,7 @@
 /**
  * WebRTC Room — mediasoup SFU server
  * ICE-Lite: server advertises fixed host candidates (listenInfos + announcedAddress)
+ * Optional ICE_SERVERS (STUN/TURN) are forwarded to browsers on join
  */
 'use strict';
 
@@ -10,19 +11,15 @@ const path = require('path');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const mediasoup = require('mediasoup');
+const { loadIceServers } = require('./ice-servers');
 
 const PORT = Number(process.env.PORT) || 3000;
 const LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
 const RTC_MIN_PORT = Number(process.env.MEDIASOUP_MIN_PORT) || 40000;
 const RTC_MAX_PORT = Number(process.env.MEDIASOUP_MAX_PORT) || 49999;
 const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS) || 12;
+const ICE_SERVERS = loadIceServers();
 
-/**
- * Resolve the address clients should use in ICE candidates.
- * - Prefer ANNOUNCED_IP / MEDIASOUP_ANNOUNCED_IP (public IP or hostname)
- * - Else first non-internal IPv4 (LAN / single-homed host)
- * - Else null (only works if LISTEN_IP is a specific interface IP)
- */
 function resolveAnnouncedAddress() {
   const env =
     process.env.ANNOUNCED_IP ||
@@ -43,7 +40,6 @@ function resolveAnnouncedAddress() {
 
 const ANNOUNCED_ADDRESS = resolveAnnouncedAddress();
 
-// Prefer modern listenInfos (udp + tcp). When binding 0.0.0.0, announcedAddress is required.
 function buildListenInfos() {
   const announcedAddress = ANNOUNCED_ADDRESS || undefined;
   if (LISTEN_IP === '0.0.0.0' || LISTEN_IP === '::') {
@@ -57,16 +53,8 @@ function buildListenInfos() {
     }
   }
   return [
-    {
-      protocol: 'udp',
-      ip: LISTEN_IP,
-      announcedAddress,
-    },
-    {
-      protocol: 'tcp',
-      ip: LISTEN_IP,
-      announcedAddress,
-    },
+    { protocol: 'udp', ip: LISTEN_IP, announcedAddress },
+    { protocol: 'tcp', ip: LISTEN_IP, announcedAddress },
   ];
 }
 
@@ -108,7 +96,6 @@ function webRtcTransportOptions() {
   };
 }
 
-/** @type {import('mediasoup').types.Worker[]} */
 let workers = [];
 let nextWorkerIdx = 0;
 const rooms = new Map();
@@ -331,6 +318,7 @@ function attachWs(server) {
                 listenIp: LISTEN_IP,
                 mode: 'ice-lite',
               },
+              iceServers: ICE_SERVERS,
             });
 
             room.broadcast(
@@ -371,6 +359,7 @@ function attachWs(server) {
               iceParameters: transport.iceParameters,
               iceCandidates,
               dtlsParameters: transport.dtlsParameters,
+              iceServers: ICE_SERVERS,
             });
             break;
           }
@@ -627,6 +616,7 @@ async function main() {
         listenIp: LISTEN_IP,
         announcedAddress: ANNOUNCED_ADDRESS,
         rtcPorts: `${RTC_MIN_PORT}-${RTC_MAX_PORT}`,
+        iceServersConfigured: ICE_SERVERS.length,
       },
       uptime: Math.round(process.uptime()),
     });
@@ -650,6 +640,7 @@ async function main() {
     console.log(
       `  Announced         ${ANNOUNCED_ADDRESS || '(none — set ANNOUNCED_IP for cloud/NAT)'}`
     );
+    console.log(`  ICE servers       ${ICE_SERVERS.length} (STUN/TURN for browsers)`);
     console.log(`  RTC ports         ${RTC_MIN_PORT}-${RTC_MAX_PORT}\n`);
   });
 
