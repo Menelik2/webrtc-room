@@ -13,9 +13,6 @@
     return;
   }
 
-  // -------------------------------------------------------------------------
-  // DOM
-  // -------------------------------------------------------------------------
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => [...document.querySelectorAll(sel)];
 
@@ -48,9 +45,6 @@
   const recordingIndicator = $('#recording-indicator');
   const toasts = $('#toasts');
 
-  // -------------------------------------------------------------------------
-  // State
-  // -------------------------------------------------------------------------
   let ws = null;
   let device = null;
   let sendTransport = null;
@@ -70,20 +64,15 @@
   let recordedChunks = [];
   let statsTimer = null;
   let pingTimer = null;
+  let meterTimer = null;
 
-  /** peerId -> { displayName, tiles: Map<source, HTMLElement>, consumers: Map } */
   const peers = new Map();
-  /** consumerId -> Consumer */
   const consumers = new Map();
-  /** producerId -> consumerId (for cleanup) */
   const producerToConsumer = new Map();
 
   let requestSeq = 0;
-  const pending = new Map(); // requestId -> { resolve, reject, timer }
+  const pending = new Map();
 
-  // -------------------------------------------------------------------------
-  // Utils
-  // -------------------------------------------------------------------------
   function toast(msg, ms = 2800) {
     const el = document.createElement('div');
     el.className = 'toast';
@@ -103,13 +92,10 @@
   function defaultSfuUrl() {
     const fromQuery = qs('sfu');
     if (fromQuery) return fromQuery;
+    const stored = localStorage.getItem('sfuUrl');
+    if (stored) return stored.includes('/ws') ? stored : stored.replace(/\/?$/, '') + '/ws';
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Same host when served by the Node server; otherwise user sets SFU in settings
-    if (location.port === '3000' || location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-      return `${proto}//${location.host}/ws`;
-    }
-    // On Vercel static host — require explicit sfu
-    return localStorage.getItem('sfuUrl') || '';
+    return `${proto}//${location.host}/ws`;
   }
 
   function request(type, payload = {}, timeoutMs = 15000) {
@@ -164,10 +150,6 @@
       case 'producerClosed':
         closeConsumerForProducer(msg.producerId);
         break;
-      case 'producerPaused':
-      case 'producerResumed':
-        // optional UI badge
-        break;
       case 'consumerClosed':
         closeConsumer(msg.consumerId);
         break;
@@ -177,16 +159,11 @@
       case 'reaction':
         showFloatingReaction(msg.emoji, msg.displayName);
         break;
-      case 'pong':
-        break;
       default:
         break;
     }
   }
 
-  // -------------------------------------------------------------------------
-  // WebSocket
-  // -------------------------------------------------------------------------
   function connectWs(url) {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(url);
@@ -221,9 +198,6 @@
     });
   }
 
-  // -------------------------------------------------------------------------
-  // Media helpers
-  // -------------------------------------------------------------------------
   async function getLocalMedia() {
     const constraints = {
       audio: {
@@ -240,7 +214,6 @@
     try {
       localStream = await navigator.mediaDevices.getUserMedia(constraints);
     } catch (e) {
-      // Fallback audio-only
       console.warn('Cam failed, trying audio only', e);
       localStream = await navigator.mediaDevices.getUserMedia({ audio: constraints.audio });
       camEnabled = false;
@@ -248,6 +221,7 @@
     localVideo.srcObject = localStream;
     localVideo.classList.toggle('mirror', mirrorLocal.checked);
     applyMicCamState();
+    startLocalMeter();
   }
 
   function applyMicCamState() {
@@ -259,9 +233,36 @@
     $('#toggle-cam')?.classList.toggle('danger-active', !camEnabled);
   }
 
-  // -------------------------------------------------------------------------
-  // Join / leave
-  // -------------------------------------------------------------------------
+  function startLocalMeter() {
+    stopLocalMeter();
+    const bar = document.querySelector('#local-meter .meter-bar');
+    if (!bar || !localStream?.getAudioTracks().length) return;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = ctx.createMediaStreamSource(localStream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      meterTimer = setInterval(() => {
+        if (!micEnabled) {
+          bar.style.height = '0%';
+          return;
+        }
+        analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / data.length / 255;
+        bar.style.height = Math.min(100, Math.round(avg * 140)) + '%';
+      }, 80);
+    } catch (_) {}
+  }
+
+  function stopLocalMeter() {
+    if (meterTimer) clearInterval(meterTimer);
+    meterTimer = null;
+  }
+
   async function joinRoom(name, rid) {
     joinBtn.disabled = true;
     joinBtn.textContent = 'Connecting…';
@@ -274,17 +275,14 @@
       if (!sfuUrl) {
         throw new Error('SFU URL required. Set it in Settings or use ?sfu=wss://host/ws');
       }
-      if (!sfuUrl.endsWith('/ws') && !sfuUrl.includes('/ws')) {
+      if (!sfuUrl.includes('/ws')) {
         sfuUrl = sfuUrl.replace(/\/?$/, '') + '/ws';
       }
       localStorage.setItem('sfuUrl', sfuUrl.replace(/\/ws$/, ''));
 
       await connectWs(sfuUrl);
 
-      const joined = await request('join', {
-        roomId,
-        displayName: name,
-      });
+      const joined = await request('join', { roomId, displayName: name });
 
       peerId = joined.peerId;
       roomId = joined.roomId;
@@ -293,13 +291,11 @@
       device = new Device();
       await device.load({ routerRtpCapabilities: joined.rtpCapabilities });
 
-      // Transports
       sendTransport = await createTransport('send');
       recvTransport = await createTransport('recv');
 
       await getLocalMedia();
 
-      // Produce
       if (localStream.getAudioTracks().length) {
         audioProducer = await sendTransport.produce({
           track: localStream.getAudioTracks()[0],
@@ -319,15 +315,11 @@
         });
       }
 
-      // Existing peers + producers
-      for (const p of joined.peers || []) {
-        ensurePeer(p.id, p.displayName);
-      }
+      for (const p of joined.peers || []) ensurePeer(p.id, p.displayName);
       for (const ep of joined.existingProducers || []) {
         await consumeProducer(ep.producerId, ep.peerId, ep.displayName, ep.kind, ep.appData);
       }
 
-      // UI
       localName.textContent = displayName;
       currentRoomEl.textContent = roomId;
       lobby.classList.add('hidden');
@@ -337,7 +329,6 @@
       startStats();
       startPing();
 
-      // Update URL without reload
       const u = new URL(location.href);
       u.searchParams.set('room', roomId);
       history.replaceState(null, '', u);
@@ -425,7 +416,7 @@
       if (peer) peer.consumers.set(consumer.id, consumer);
 
       const source = (appData && appData.source) || kind;
-      attachRemoteTrack(remotePeerId, remoteName, consumer.track, source, consumer.id);
+      attachRemoteTrack(remotePeerId, remoteName, consumer.track, source);
 
       await request('resumeConsumer', { consumerId: consumer.id });
       updateParticipants();
@@ -446,7 +437,7 @@
     }
   }
 
-  function attachRemoteTrack(remotePeerId, remoteName, track, source, consumerId) {
+  function attachRemoteTrack(remotePeerId, remoteName, track, source) {
     const peer = peers.get(remotePeerId);
     if (!peer) return;
 
@@ -461,7 +452,7 @@
         <div class="tile-overlay">
           <div class="tile-label">
             <span class="remote-name">${escapeHtml(remoteName)}</span>
-            <span class="source-badge">${source === 'screen' ? '🖥️' : source === 'camera' ? '' : ''}</span>
+            <span class="source-badge">${source === 'screen' ? '🖥️' : ''}</span>
           </div>
         </div>`;
       videosGrid.appendChild(tile);
@@ -474,10 +465,8 @@
       stream = new MediaStream();
       video.srcObject = stream;
     }
-    // Replace same-kind track if present
     stream.getTracks().filter((t) => t.kind === track.kind).forEach((t) => {
       stream.removeTrack(t);
-      t.stop();
     });
     stream.addTrack(track);
     video.play().catch(() => {});
@@ -504,25 +493,18 @@
     try { consumer.close(); } catch (_) {}
     consumers.delete(consumerId);
 
-    // Remove track from tile / remove empty tile
-    for (const [pid, peer] of peers) {
-      if (peer.consumers.has(consumerId)) {
-        peer.consumers.delete(consumerId);
-      }
-      for (const [source, tile] of peer.tiles) {
+    for (const peer of peers.values()) {
+      peer.consumers.delete(consumerId);
+      for (const [source, tile] of [...peer.tiles]) {
         const video = tile.querySelector('video');
         const stream = video?.srcObject;
         if (stream) {
-          const tracks = stream.getTracks();
-          // If no live tracks left, remove tile
-          if (tracks.every((t) => t.readyState === 'ended' || !t.enabled)) {
+          const live = stream.getTracks().filter((t) => t.readyState === 'live');
+          if (live.length === 0) {
             tile.remove();
             peer.tiles.delete(source);
           }
         }
-      }
-      if (peer.tiles.size === 0 && peer.consumers.size === 0) {
-        // keep peer entry until peerLeft
       }
     }
   }
@@ -541,6 +523,7 @@
   function cleanupMedia() {
     stopStats();
     stopPing();
+    stopLocalMeter();
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
       try { mediaRecorder.stop(); } catch (_) {}
     }
@@ -598,48 +581,38 @@
     reactionsBar.classList.add('hidden');
   }
 
-  // -------------------------------------------------------------------------
-  // UI helpers
-  // -------------------------------------------------------------------------
   function escapeHtml(s) {
     return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/&/g, '&')
+      .replace(/</g, '<')
+      .replace(/>/g, '>')
+      .replace(/"/g, '"');
   }
 
   function updatePeerCount() {
-    const n = peers.size + 1;
-    peerCountEl.textContent = String(n);
+    peerCountEl.textContent = String(peers.size + 1);
   }
 
   function updateParticipants() {
     participantsList.innerHTML = '';
-    const add = (id, name, isLocal) => {
+    const add = (name, isLocal) => {
       const li = document.createElement('li');
-      li.style.cssText = 'padding:.5rem .75rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;';
-      li.innerHTML = `<span>${escapeHtml(name)}${isLocal ? ' (you)' : ''}</span>`;
+      li.innerHTML = `<span>${escapeHtml(name)}${isLocal ? ' <span class="muted">(you)</span>' : ''}</span>`;
       participantsList.appendChild(li);
     };
-    add(peerId, displayName, true);
-    for (const [id, p] of peers) add(id, p.displayName, false);
+    add(displayName, true);
+    for (const p of peers.values()) add(p.displayName, false);
   }
 
-  function appendChat(name, text, isSelf) {
+  function appendChat(name, text) {
     const div = document.createElement('div');
-    div.style.cssText = 'margin-bottom:.65rem;';
-    div.innerHTML = `<strong style="color:var(--primary)">${escapeHtml(name)}</strong>
-      <span style="color:var(--text-muted);font-size:.75rem;margin-left:.35rem"></span>
-      <div>${escapeHtml(text)}</div>`;
+    div.className = 'chat-msg';
+    div.innerHTML = `<div class="who">${escapeHtml(name)}</div><div class="body">${escapeHtml(text)}</div>`;
     chatMessages.appendChild(div);
     chatMessages.scrollTop = chatMessages.scrollHeight;
-    if (!$('#chat-panel').classList.contains('hidden') === false && !isSelf) {
-      // if panel closed, toast
-    }
   }
 
-  function showFloatingReaction(emoji, name) {
+  function showFloatingReaction(emoji) {
     const el = document.createElement('div');
     el.textContent = emoji;
     el.style.cssText =
@@ -655,17 +628,17 @@
     setTimeout(() => el.remove(), 2300);
   }
 
-  // -------------------------------------------------------------------------
-  // Controls
-  // -------------------------------------------------------------------------
   async function toggleMic() {
     micEnabled = !micEnabled;
     applyMicCamState();
     if (audioProducer) {
-      if (micEnabled) await request('resumeProducer', { producerId: audioProducer.id }).catch(() => {});
-      else await request('pauseProducer', { producerId: audioProducer.id }).catch(() => {});
-      if (micEnabled) await audioProducer.resume();
-      else await audioProducer.pause();
+      if (micEnabled) {
+        await audioProducer.resume();
+        await request('resumeProducer', { producerId: audioProducer.id }).catch(() => {});
+      } else {
+        await audioProducer.pause();
+        await request('pauseProducer', { producerId: audioProducer.id }).catch(() => {});
+      }
     }
   }
 
@@ -691,7 +664,6 @@
   async function toggleScreen() {
     const btn = $('#toggle-screen');
     if (screenProducer) {
-      // stop
       try {
         await request('closeProducer', { producerId: screenProducer.id });
       } catch (_) {}
@@ -711,7 +683,9 @@
         audio: false,
       });
       const track = screenStream.getVideoTracks()[0];
-      track.onended = () => toggleScreen();
+      track.onended = () => {
+        if (screenProducer) toggleScreen();
+      };
       screenProducer = await sendTransport.produce({
         track,
         appData: { source: 'screen' },
@@ -726,7 +700,7 @@
   function toggleNoise() {
     noiseSuppression = !noiseSuppression;
     $('#toggle-noise')?.classList.toggle('active', noiseSuppression);
-    toast(noiseSuppression ? 'Noise suppression on (next join)' : 'Noise suppression off (next join)');
+    toast(noiseSuppression ? 'Noise suppression on (applies next join)' : 'Noise suppression off (applies next join)');
   }
 
   function toggleRecord() {
@@ -734,19 +708,15 @@
       mediaRecorder.stop();
       return;
     }
-    const streams = [];
-    if (localStream) streams.push(localStream);
-    // Mix is limited in browser without AudioContext; record local for simplicity
-    const recStream = localStream;
-    if (!recStream) {
+    if (!localStream) {
       toast('No media to record');
       return;
     }
     recordedChunks = [];
     try {
-      mediaRecorder = new MediaRecorder(recStream, { mimeType: 'video/webm;codecs=vp9,opus' });
+      mediaRecorder = new MediaRecorder(localStream, { mimeType: 'video/webm;codecs=vp9,opus' });
     } catch {
-      mediaRecorder = new MediaRecorder(recStream);
+      mediaRecorder = new MediaRecorder(localStream);
     }
     mediaRecorder.ondataavailable = (e) => {
       if (e.data.size) recordedChunks.push(e.data);
@@ -781,7 +751,7 @@
           st.forEach((r) => {
             if (r.type === 'outbound-rtp' && !r.isRemote) {
               lines.push(
-                `↑ ${r.kind}: ${Math.round((r.bytesSent || 0) / 1024)} KB, bit ${Math.round((r.bitrate || 0) / 1000) || '—'} kbps`
+                `↑ ${r.kind}: ${Math.round((r.bytesSent || 0) / 1024)} KB`
               );
             }
           });
@@ -797,10 +767,9 @@
           });
         }
       } catch (_) {}
-      statsContent.innerHTML =
-        lines.length
-          ? lines.map((l) => `<div style="margin:.35rem 0;font-size:.85rem">${escapeHtml(l)}</div>`).join('')
-          : '<p class="muted">Collecting…</p>';
+      statsContent.innerHTML = lines.length
+        ? lines.map((l) => `<div>${escapeHtml(l)}</div>`).join('')
+        : '<p class="muted">Collecting…</p>';
     }, 2000);
   }
 
@@ -812,9 +781,7 @@
   function startPing() {
     stopPing();
     pingTimer = setInterval(() => {
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: 'ping' }));
-      }
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
     }, 25000);
   }
 
@@ -833,7 +800,7 @@
           .forEach((d) => {
             const opt = document.createElement('option');
             opt.value = d.deviceId;
-            opt.textContent = d.label || `${kind} ${sel.length + 1}`;
+            opt.textContent = d.label || `${kind} ${sel.options.length + 1}`;
             sel.appendChild(opt);
           });
       };
@@ -860,9 +827,6 @@
     toast('Settings applied');
   }
 
-  // -------------------------------------------------------------------------
-  // Event bindings
-  // -------------------------------------------------------------------------
   joinForm.addEventListener('submit', (e) => {
     e.preventDefault();
     joinRoom(displayNameInput.value.trim() || 'Guest', roomIdInput.value.trim());
@@ -874,9 +838,7 @@
   $('#toggle-screen')?.addEventListener('click', () => toggleScreen());
   $('#toggle-noise')?.addEventListener('click', () => toggleNoise());
   $('#toggle-record')?.addEventListener('click', () => toggleRecord());
-  $('#toggle-reactions')?.addEventListener('click', () => {
-    reactionsBar.classList.toggle('hidden');
-  });
+  $('#toggle-reactions')?.addEventListener('click', () => reactionsBar.classList.toggle('hidden'));
   $('#toggle-participants')?.addEventListener('click', () => {
     $('#participants-panel').classList.toggle('hidden');
     $('#chat-panel').classList.add('hidden');
@@ -912,10 +874,8 @@
     const btn = e.target.closest('button[data-emoji]');
     if (!btn) return;
     const emoji = btn.dataset.emoji;
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'reaction', emoji }));
-    }
-    showFloatingReaction(emoji, displayName);
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'reaction', emoji }));
+    showFloatingReaction(emoji);
   });
 
   chatForm?.addEventListener('submit', (e) => {
@@ -933,11 +893,10 @@
     const u = new URL(location.href);
     u.searchParams.set('room', roomId || '');
     const sfu = localStorage.getItem('sfuUrl');
-    if (sfu) u.searchParams.set('sfu', sfu.endsWith('/ws') ? sfu : sfu + '/ws');
+    if (sfu) u.searchParams.set('sfu', sfu.includes('/ws') ? sfu : sfu + '/ws');
     navigator.clipboard.writeText(u.toString()).then(() => toast('Invite link copied'));
   });
 
-  // Prefill from URL
   const qRoom = qs('room');
   const qName = qs('name');
   if (qRoom) roomIdInput.value = qRoom;
@@ -947,8 +906,6 @@
     localStorage.setItem('displayName', displayNameInput.value.trim());
   });
 
-  // Noise default on
   $('#toggle-noise')?.classList.add('active');
-
   console.log('[WebRTC Room] client ready');
 })();
