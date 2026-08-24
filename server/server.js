@@ -18,12 +18,7 @@ const RTC_MAX_PORT = Number(process.env.MEDIASOUP_MAX_PORT) || 49999;
 const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS) || 12;
 
 const mediaCodecs = [
-  {
-    kind: 'audio',
-    mimeType: 'audio/opus',
-    clockRate: 48000,
-    channels: 2,
-  },
+  { kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
   {
     kind: 'video',
     mimeType: 'video/VP8',
@@ -50,12 +45,7 @@ const mediaCodecs = [
 ];
 
 const webRtcTransportOptions = {
-  listenIps: [
-    {
-      ip: LISTEN_IP,
-      announcedIp: ANNOUNCED_IP || undefined,
-    },
-  ],
+  listenIps: [{ ip: LISTEN_IP, announcedIp: ANNOUNCED_IP || undefined }],
   enableUdp: true,
   enableTcp: true,
   preferUdp: true,
@@ -110,6 +100,7 @@ class Room {
     this.id = id;
     this.router = router;
     this.peers = new Map();
+    this.pin = null; // optional string PIN set by first peer
   }
 
   get peerCount() {
@@ -185,14 +176,17 @@ function safeRoomId(raw) {
   return cleaned || genId('r');
 }
 
+function normalizePin(raw) {
+  if (raw == null || raw === '') return null;
+  return String(raw).slice(0, 32);
+}
+
 function attachWs(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws, req) => {
     const peerId = genId('p');
-    /** @type {Peer|null} */
     let peer = null;
-    /** @type {Room|null} */
     let room = null;
 
     console.log(`[ws] connect ${peerId} from ${req.socket.remoteAddress}`);
@@ -218,8 +212,19 @@ function attachWs(server) {
             if (peer) return reply({ type: 'error', error: 'already_joined' });
             const roomId = safeRoomId(data.roomId);
             const displayName = String(data.displayName || 'Guest').slice(0, 32);
+            const pin = normalizePin(data.pin);
 
             room = await getOrCreateRoom(roomId);
+
+            // PIN: first peer may set; later peers must match if set
+            if (room.peerCount === 0) {
+              room.pin = pin;
+            } else if (room.pin) {
+              if (pin !== room.pin) {
+                return reply({ type: 'error', error: 'invalid_pin' });
+              }
+            }
+
             if (room.peerCount >= MAX_PEERS_PER_ROOM) {
               return reply({ type: 'error', error: 'room_full' });
             }
@@ -246,16 +251,14 @@ function attachWs(server) {
               peerId,
               roomId: room.id,
               displayName,
+              hasPin: Boolean(room.pin),
               rtpCapabilities: room.router.rtpCapabilities,
               peers: room.peerList().filter((p) => p.id !== peerId),
               existingProducers,
             });
 
             room.broadcast(
-              {
-                type: 'peerJoined',
-                peer: { id: peerId, displayName, producers: [] },
-              },
+              { type: 'peerJoined', peer: { id: peerId, displayName, producers: [] } },
               peerId
             );
             console.log(`[room ${room.id}] ${displayName} (${peerId}) joined — ${room.peerCount} peers`);
@@ -264,21 +267,15 @@ function attachWs(server) {
 
           case 'createWebRtcTransport': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
-
             const transport = await room.router.createWebRtcTransport({
               ...webRtcTransportOptions,
               appData: { peerId, direction: data.direction || 'sendrecv' },
             });
-
             transport.on('dtlsstatechange', (state) => {
               if (state === 'closed') transport.close();
             });
-            transport.on('close', () => {
-              peer?.transports.delete(transport.id);
-            });
-
+            transport.on('close', () => peer?.transports.delete(transport.id));
             peer.transports.set(transport.id, transport);
-
             reply({
               type: 'webRtcTransportCreated',
               id: transport.id,
@@ -302,20 +299,14 @@ function attachWs(server) {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
             const transport = peer.transports.get(data.transportId);
             if (!transport) return reply({ type: 'error', error: 'transport_not_found' });
-
             const producer = await transport.produce({
               kind: data.kind,
               rtpParameters: data.rtpParameters,
               appData: data.appData || {},
             });
-
             peer.producers.set(producer.id, producer);
-            producer.on('transportclose', () => {
-              peer?.producers.delete(producer.id);
-            });
-
+            producer.on('transportclose', () => peer?.producers.delete(producer.id));
             reply({ type: 'produced', id: producer.id });
-
             room.broadcast(
               {
                 type: 'newProducer',
@@ -332,7 +323,6 @@ function attachWs(server) {
 
           case 'consume': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
-
             let targetProducer = null;
             let producerPeerId = null;
             for (const [oid, other] of room.peers) {
@@ -344,20 +334,16 @@ function attachWs(server) {
               }
             }
             if (!targetProducer) return reply({ type: 'error', error: 'producer_not_found' });
-
             if (!room.router.canConsume({ producerId: targetProducer.id, rtpCapabilities: data.rtpCapabilities })) {
               return reply({ type: 'error', error: 'cannot_consume' });
             }
-
             const transport = peer.transports.get(data.transportId);
             if (!transport) return reply({ type: 'error', error: 'transport_not_found' });
-
             const consumer = await transport.consume({
               producerId: targetProducer.id,
               rtpCapabilities: data.rtpCapabilities,
               paused: true,
             });
-
             peer.consumers.set(consumer.id, consumer);
             consumer.on('transportclose', () => peer?.consumers.delete(consumer.id));
             consumer.on('producerclose', () => {
@@ -368,7 +354,6 @@ function attachWs(server) {
                 producerId: targetProducer.id,
               });
             });
-
             reply({
               type: 'consumed',
               id: consumer.id,
@@ -493,11 +478,9 @@ function attachWs(server) {
       const rid = room.id;
       const name = peer.displayName;
       const pid = peer.id;
-
       for (const prod of peer.producers.values()) {
         room.broadcast({ type: 'producerClosed', peerId: pid, producerId: prod.id }, pid);
       }
-
       peer.close();
       room.peers.delete(pid);
       room.broadcast({ type: 'peerLeft', peerId: pid, displayName: name });
