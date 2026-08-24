@@ -2,7 +2,7 @@
   "name": "webrtc-room",
   "version": "2.2.0",
   "private": true,
-  "description": "WebRTC SFU room — mediasoup + static client",
+  "description": "Professional WebRTC SFU room — mediasoup + static client",
   "scripts": {
     "validate": "node scripts/validate.js",
     "start": "npm --prefix server start",

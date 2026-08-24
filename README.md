@@ -1,73 +1,71 @@
 # WebRTC Room (mediasoup SFU)
 
-Professional multi-party video / voice / screen-share rooms powered by **mediasoup**.
+Professional peer-to-peer **voice, video, and screen-sharing** rooms powered by a **mediasoup** Selective Forwarding Unit (SFU).
+
+![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![mediasoup](https://img.shields.io/badge/mediasoup-3.x-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ## Features
 
-- Multi-party audio & video (SFU — scales better than pure mesh)
+- Multi-party SFU (not mesh) — scales better than pure P2P
+- Camera + microphone with mute / pause
 - Screen sharing
-- Mute / camera toggle
-- Noise suppression toggle
-- In-room chat & emoji reactions
-- Participants list
-- Network stats
+- Live chat & emoji reactions
+- Participants list & basic WebRTC stats
 - Device selection (camera / mic / speaker)
 - Local recording (WebM download)
-- Invite link with room ID
-- Works locally or with remote SFU (`?sfu=wss://host`)
+- Invite links with room ID + optional remote SFU URL
+- Vercel-ready static client; SFU runs on any Node host
 
 ## Quick start (local)
 
 ```bash
-# From repo root
-cd server
-npm install
+# 1. Install server deps
+cd server && npm install && cd ..
+
+# 2. Start SFU + static UI
 npm start
+# or: cd server && npm start
 ```
 
 Open **http://localhost:3000**
 
-Optional environment variables:
+Join the same room ID from two browsers / devices to test.
+
+## Environment variables (server)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3000` | HTTP + WS port |
-| `LISTEN_IP` | `0.0.0.0` | Bind address |
-| `ANNOUNCED_IP` | _(none)_ | Public IP for ICE (required behind NAT/Docker) |
-| `RTC_MIN_PORT` | `40000` | mediasoup UDP/TCP range start |
-| `RTC_MAX_PORT` | `49999` | mediasoup UDP/TCP range end |
+| `ANNOUNCED_IP` / `MEDIASOUP_ANNOUNCED_IP` | — | Public IP/hostname for ICE (required behind NAT / cloud) |
+| `MEDIASOUP_LISTEN_IP` | `0.0.0.0` | Bind address for RTC |
+| `MEDIASOUP_MIN_PORT` | `40000` | RTC UDP/TCP range start |
+| `MEDIASOUP_MAX_PORT` | `49999` | RTC UDP/TCP range end |
+| `MAX_PEERS` | `12` | Max peers per room |
 
-Example with public IP:
-
-```bash
-ANNOUNCED_IP=203.0.113.10 npm start
-```
-
-## Deploy
-
-### Client (static) on Vercel
-
-The UI deploys from `client/`. The **SFU cannot run on Vercel** (needs long-lived WebSocket + UDP ports).
+Example (VPS):
 
 ```bash
-# vercel.json already points output to client/
+export ANNOUNCED_IP=203.0.113.10
+export PORT=3000
+cd server && npm start
 ```
 
-### SFU server
+Open firewall for `PORT` (TCP) and `40000-49999` (UDP+TCP).
 
-Host `server/` on **Railway, Render, Fly.io, a VPS, or Docker**.
+## Vercel (client only)
 
-Requirements:
-- Node.js ≥ 18
-- Open TCP port for HTTP/WS
-- Open UDP/TCP range `40000–49999` (or your `RTC_*` range) for media
-- Set `ANNOUNCED_IP` to the machine’s public IP
+The **SFU cannot run on Vercel** (no long-lived WebSocket + UDP). Deploy only the static UI:
 
-Then join with:
+- `vercel.json` already points `outputDirectory` to `client/`
+- Host `server/` on **Railway**, **Render**, **Fly.io**, **DigitalOcean**, or any VPS
+
+Remote join URL pattern:
 
 ```
-https://YOUR-CLIENT.vercel.app/?room=standup&sfu=wss://YOUR-SFU-HOST
+https://YOUR.vercel.app/?room=standup&sfu=wss://YOUR-SFU-HOST/ws
 ```
+
+Or set the SFU URL in **Settings** inside the app (saved to `localStorage`).
 
 ## Project layout
 
@@ -76,23 +74,34 @@ webrtc-room/
 ├── client/
 │   ├── index.html    # UI shell
 │   ├── style.css     # Dark pro theme
-│   └── app.js        # mediasoup-client + full UX
+│   └── app.js        # mediasoup-client + signaling
 ├── server/
 │   ├── package.json
-│   └── server.js     # Express + WS signaling + mediasoup SFU
+│   └── server.js     # Express + WS + mediasoup SFU
+├── scripts/
+│   └── validate.js
 ├── package.json
 ├── vercel.json
 └── README.md
 ```
 
-## Architecture (short)
+## Signaling (WebSocket `/ws`)
 
-1. Client opens WebSocket to `/ws` and sends `join`.
-2. Server creates/gets a mediasoup **Router** per room.
-3. Client creates **send** + **recv** WebRtcTransports.
-4. Client **produces** mic/camera/screen tracks.
-5. Server notifies others → they **consume** those producers.
-6. Chat, reactions, rename are pure signaling messages.
+JSON messages with optional `requestId` for request/response.
+
+| Client → Server | Server → Client |
+|-----------------|-----------------|
+| `join` | `joined`, `peerJoined` |
+| `createWebRtcTransport` | `webRtcTransportCreated` |
+| `connectWebRtcTransport` | `webRtcTransportConnected` |
+| `produce` | `produced`, `newProducer` |
+| `consume` | `consumed` |
+| `resumeConsumer` | `consumerResumed` |
+| `pauseProducer` / `resumeProducer` | `producerPaused` / `producerResumed` |
+| `closeProducer` | `producerClosed` |
+| `chat` | `chat` |
+| `reaction` | `reaction` |
+| `leave` | `peerLeft` |
 
 ## License
 

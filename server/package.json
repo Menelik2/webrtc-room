@@ -1,15 +1,16 @@
 {
   "name": "webrtc-sfu-server",
   "version": "2.2.0",
+  "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "validate": "node --check server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "express": "^4.21.2",
     "mediasoup": "^3.14.14",
-    "ws": "^8.17.1"
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": ">=18"
