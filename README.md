@@ -15,6 +15,7 @@ Professional multi-party **voice, video, and screen-sharing** rooms powered by a
 - Device selection with **mid-call hot-swap** (replaceTrack)
 - Local recording (WebM)
 - Keyboard shortcuts: **M** mic · **C** cam · **S** screen · **Esc** close panels
+- Optional **STUN/TURN** via `ICE_SERVERS` (browser `iceServers`)
 - Invite links (`?room=` + optional `?sfu=`)
 - Docker + Railway / Render / Fly configs
 - Vercel-ready static client
@@ -42,9 +43,25 @@ See [`.env.example`](.env.example). Copy to `server/.env` or export before start
 |----------|---------|--------|
 | `PORT` | `3000` | HTTP + WebSocket |
 | `ANNOUNCED_IP` | auto LAN IPv4 | **Set explicitly on cloud/NAT** (public IP or hostname) |
+| `ICE_SERVERS` | `[]` | JSON array of STUN/TURN for the **browser** |
 | `MEDIASOUP_LISTEN_IP` | `0.0.0.0` | Bind address for RTC |
 | `MEDIASOUP_MIN_PORT` / `MAX` | `40000` / `49999` | Open **UDP + TCP** in firewall |
 | `MAX_PEERS` | `12` | Max peers per room |
+
+### Example `ICE_SERVERS`
+
+```bash
+# STUN only (client also falls back to Google STUN if empty)
+export ICE_SERVERS='[{"urls":"stun:stun.l.google.com:19302"}]'
+
+# STUN + TURN (recommended for hard NAT / mobile networks)
+export ICE_SERVERS='[
+  {"urls":"stun:stun.l.google.com:19302"},
+  {"urls":"turn:turn.example.com:3478","username":"user","credential":"secret"}
+]'
+```
+
+These are sent to the client on `join` / transport create and passed into `mediasoup-client` as `iceServers`.
 
 ## WebRTC ICE (important)
 
@@ -53,14 +70,16 @@ mediasoup uses **ICE-Lite**: the SFU does **not** gather candidates the way a br
 | Side | Behavior |
 |------|----------|
 | **SFU** | Builds candidates from `listenInfos` + `announcedAddress` (`ANNOUNCED_IP`) |
-| **Browser** | Gathers local host/srflx candidates and checks connectivity **to** the SFU |
+| **Browser** | Connects **to** the SFU; optional STUN/TURN via `ICE_SERVERS` |
 
 ### How candidates are produced
 
 1. Server creates a `WebRtcTransport` with UDP + TCP `listenInfos`.
 2. If `ANNOUNCED_IP` is set, that address is put in the ICE candidate `ip` field (required behind NAT/cloud).
 3. If unset, the server tries the first non-internal IPv4 (works on many LAN setups).
-4. Client receives `iceParameters` + `iceCandidates` + `dtlsParameters` over `/ws` and passes them into `mediasoup-client` transports.
+4. Client receives `iceParameters` + `iceCandidates` + `dtlsParameters` (+ optional `iceServers`) over `/ws`.
+
+> **STUN vs TURN with mediasoup:** STUN alone rarely changes connectivity to an ICE-Lite SFU. **TURN** helps when the client cannot reach the SFU’s public IP/ports (symmetric NAT). Always set `ANNOUNCED_IP` and open RTC ports first.
 
 ### Health payload (ICE summary)
 
@@ -75,7 +94,8 @@ Example:
   "mode": "ice-lite",
   "listenIp": "0.0.0.0",
   "announcedAddress": "203.0.113.10",
-  "rtcPorts": "40000-49999"
+  "rtcPorts": "40000-49999",
+  "iceServersConfigured": 2
 }
 ```
 
@@ -91,10 +111,8 @@ Server logs also print candidates when a transport is created:
 |---------|--------------|-----|
 | Connects locally, fails remotely | Missing public address | Set `ANNOUNCED_IP` to public IP or hostname |
 | `connectionState: failed` | RTC ports blocked | Open UDP+TCP `40000–49999` (or your range) |
-| Works on Wi‑Fi, fails on mobile data | Symmetric NAT | Deploy SFU on public IP; consider TURN for extreme cases |
+| Works on Wi‑Fi, fails on mobile data | Symmetric NAT | Public SFU + optional **TURN** in `ICE_SERVERS` |
 | Candidates show `0.0.0.0` | No announced IP | Set `ANNOUNCED_IP` |
-
-> **Note:** Strict corporate/mobile networks may still need a **TURN** server. mediasoup does not embed TURN; you would add `iceServers` on the client if required.
 
 ## Room PIN
 
@@ -153,12 +171,13 @@ Or set **SFU URL** in the in-app Settings panel (stored in `localStorage`).
 ## Project layout
 
 ```text
-client/          UI (HTML/CSS/JS + mediasoup-client CDN)
-  app.js         Signaling, media, ICE transport setup
-  index.html     Lobby + call UI
+client/               UI (HTML/CSS/JS + mediasoup-client CDN)
+  app.js              Signaling, media, iceServers on transports
+  index.html          Lobby + call UI
   style.css
 server/
-  server.js      Express + WebSocket + mediasoup workers/routers
+  server.js           Express + WebSocket + mediasoup workers/routers
+  ice-servers.js      Parse ICE_SERVERS env for browsers
   package.json
 scripts/
   validate.js
@@ -176,8 +195,8 @@ Dockerfile  railway.toml  render.yaml  fly.toml  vercel.json
 
 | Client → server | Server → client |
 |-----------------|-----------------|
-| `join` | `joined` / `error` |
-| `createWebRtcTransport` | `webRtcTransportCreated` (`iceParameters`, `iceCandidates`, `dtlsParameters`) |
+| `join` | `joined` (`iceServers`, `ice`, …) / `error` |
+| `createWebRtcTransport` | `webRtcTransportCreated` (`iceParameters`, `iceCandidates`, `dtlsParameters`, `iceServers`) |
 | `connectWebRtcTransport` | `webRtcTransportConnected` |
 | `produce` / `consume` / `resumeConsumer` | `produced` / `consumed` / … |
 | `pauseProducer` / `resumeProducer` / `closeProducer` | `ok` + peer events |
