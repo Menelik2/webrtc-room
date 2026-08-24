@@ -1,21 +1,74 @@
 /**
  * WebRTC Room — mediasoup SFU server
- * Express static + WebSocket signaling + mediasoup workers/routers/transports
+ * ICE-Lite: server advertises fixed host candidates (listenInfos + announcedAddress)
  */
 'use strict';
 
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const mediasoup = require('mediasoup');
 
 const PORT = Number(process.env.PORT) || 3000;
-const ANNOUNCED_IP = process.env.ANNOUNCED_IP || process.env.MEDIASOUP_ANNOUNCED_IP || null;
 const LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
 const RTC_MIN_PORT = Number(process.env.MEDIASOUP_MIN_PORT) || 40000;
 const RTC_MAX_PORT = Number(process.env.MEDIASOUP_MAX_PORT) || 49999;
 const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS) || 12;
+
+/**
+ * Resolve the address clients should use in ICE candidates.
+ * - Prefer ANNOUNCED_IP / MEDIASOUP_ANNOUNCED_IP (public IP or hostname)
+ * - Else first non-internal IPv4 (LAN / single-homed host)
+ * - Else null (only works if LISTEN_IP is a specific interface IP)
+ */
+function resolveAnnouncedAddress() {
+  const env =
+    process.env.ANNOUNCED_IP ||
+    process.env.MEDIASOUP_ANNOUNCED_IP ||
+    process.env.MEDIASOUP_ANNOUNCED_ADDRESS ||
+    '';
+  if (env.trim()) return env.trim();
+
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets || {})) {
+    for (const net of nets[name] || []) {
+      const family = net.family === 'IPv4' || net.family === 4;
+      if (family && !net.internal) return net.address;
+    }
+  }
+  return null;
+}
+
+const ANNOUNCED_ADDRESS = resolveAnnouncedAddress();
+
+// Prefer modern listenInfos (udp + tcp). When binding 0.0.0.0, announcedAddress is required.
+function buildListenInfos() {
+  const announcedAddress = ANNOUNCED_ADDRESS || undefined;
+  if (LISTEN_IP === '0.0.0.0' || LISTEN_IP === '::') {
+    if (!announcedAddress) {
+      console.warn(
+        '[ice] WARNING: listening on ' +
+          LISTEN_IP +
+          ' without ANNOUNCED_IP — ICE candidates may be unusable for remote clients. ' +
+          'Set ANNOUNCED_IP to your public IP or hostname.'
+      );
+    }
+  }
+  return [
+    {
+      protocol: 'udp',
+      ip: LISTEN_IP,
+      announcedAddress,
+    },
+    {
+      protocol: 'tcp',
+      ip: LISTEN_IP,
+      announcedAddress,
+    },
+  ];
+}
 
 const mediaCodecs = [
   { kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
@@ -44,14 +97,16 @@ const mediaCodecs = [
   },
 ];
 
-const webRtcTransportOptions = {
-  listenIps: [{ ip: LISTEN_IP, announcedIp: ANNOUNCED_IP || undefined }],
-  enableUdp: true,
-  enableTcp: true,
-  preferUdp: true,
-  initialAvailableOutgoingBitrate: 1_000_000,
-  maxIncomingBitrate: 3_000_000,
-};
+function webRtcTransportOptions() {
+  return {
+    listenInfos: buildListenInfos(),
+    enableUdp: true,
+    enableTcp: true,
+    preferUdp: true,
+    initialAvailableOutgoingBitrate: 1_000_000,
+    maxIncomingBitrate: 3_000_000,
+  };
+}
 
 /** @type {import('mediasoup').types.Worker[]} */
 let workers = [];
@@ -81,13 +136,19 @@ class Peer {
 
   close() {
     for (const c of this.consumers.values()) {
-      try { c.close(); } catch (_) {}
+      try {
+        c.close();
+      } catch (_) {}
     }
     for (const p of this.producers.values()) {
-      try { p.close(); } catch (_) {}
+      try {
+        p.close();
+      } catch (_) {}
     }
     for (const t of this.transports.values()) {
-      try { t.close(); } catch (_) {}
+      try {
+        t.close();
+      } catch (_) {}
     }
     this.consumers.clear();
     this.producers.clear();
@@ -100,7 +161,7 @@ class Room {
     this.id = id;
     this.router = router;
     this.peers = new Map();
-    this.pin = null; // optional string PIN set by first peer
+    this.pin = null;
   }
 
   get peerCount() {
@@ -149,7 +210,7 @@ async function getOrCreateRoom(roomId) {
 }
 
 async function createWorkers() {
-  const num = Math.max(1, Math.min(4, require('os').cpus().length));
+  const num = Math.max(1, Math.min(4, os.cpus().length));
   for (let i = 0; i < num; i++) {
     const worker = await mediasoup.createWorker({
       logLevel: process.env.MEDIASOUP_LOG_LEVEL || 'warn',
@@ -179,6 +240,17 @@ function safeRoomId(raw) {
 function normalizePin(raw) {
   if (raw == null || raw === '') return null;
   return String(raw).slice(0, 32);
+}
+
+function formatIceCandidates(cands) {
+  return (cands || []).map((c) => ({
+    foundation: c.foundation,
+    priority: c.priority,
+    ip: c.ip,
+    protocol: c.protocol,
+    port: c.port,
+    type: c.type,
+  }));
 }
 
 function attachWs(server) {
@@ -216,7 +288,6 @@ function attachWs(server) {
 
             room = await getOrCreateRoom(roomId);
 
-            // PIN: first peer may set; later peers must match if set
             if (room.peerCount === 0) {
               room.pin = pin;
             } else if (room.pin) {
@@ -255,6 +326,11 @@ function attachWs(server) {
               rtpCapabilities: room.router.rtpCapabilities,
               peers: room.peerList().filter((p) => p.id !== peerId),
               existingProducers,
+              ice: {
+                announcedAddress: ANNOUNCED_ADDRESS,
+                listenIp: LISTEN_IP,
+                mode: 'ice-lite',
+              },
             });
 
             room.broadcast(
@@ -267,20 +343,33 @@ function attachWs(server) {
 
           case 'createWebRtcTransport': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
+
             const transport = await room.router.createWebRtcTransport({
-              ...webRtcTransportOptions,
+              ...webRtcTransportOptions(),
               appData: { peerId, direction: data.direction || 'sendrecv' },
             });
+
             transport.on('dtlsstatechange', (state) => {
               if (state === 'closed') transport.close();
             });
+            transport.on('icestatechange', (state) => {
+              console.log(`[ice] transport ${transport.id} iceState=${state}`);
+            });
             transport.on('close', () => peer?.transports.delete(transport.id));
+
             peer.transports.set(transport.id, transport);
+
+            const iceCandidates = transport.iceCandidates;
+            console.log(
+              `[ice] transport ${transport.id} candidates:`,
+              JSON.stringify(formatIceCandidates(iceCandidates))
+            );
+
             reply({
               type: 'webRtcTransportCreated',
               id: transport.id,
               iceParameters: transport.iceParameters,
-              iceCandidates: transport.iceCandidates,
+              iceCandidates,
               dtlsParameters: transport.dtlsParameters,
             });
             break;
@@ -334,7 +423,12 @@ function attachWs(server) {
               }
             }
             if (!targetProducer) return reply({ type: 'error', error: 'producer_not_found' });
-            if (!room.router.canConsume({ producerId: targetProducer.id, rtpCapabilities: data.rtpCapabilities })) {
+            if (
+              !room.router.canConsume({
+                producerId: targetProducer.id,
+                rtpCapabilities: data.rtpCapabilities,
+              })
+            ) {
               return reply({ type: 'error', error: 'cannot_consume' });
             }
             const transport = peer.transports.get(data.transportId);
@@ -381,7 +475,10 @@ function attachWs(server) {
             const producer = peer.producers.get(data.producerId);
             if (!producer) return reply({ type: 'error', error: 'producer_not_found' });
             await producer.pause();
-            room?.broadcast({ type: 'producerPaused', peerId: peer.id, producerId: producer.id }, peer.id);
+            room?.broadcast(
+              { type: 'producerPaused', peerId: peer.id, producerId: producer.id },
+              peer.id
+            );
             reply({ type: 'ok' });
             break;
           }
@@ -391,7 +488,10 @@ function attachWs(server) {
             const producer = peer.producers.get(data.producerId);
             if (!producer) return reply({ type: 'error', error: 'producer_not_found' });
             await producer.resume();
-            room?.broadcast({ type: 'producerResumed', peerId: peer.id, producerId: producer.id }, peer.id);
+            room?.broadcast(
+              { type: 'producerResumed', peerId: peer.id, producerId: producer.id },
+              peer.id
+            );
             reply({ type: 'ok' });
             break;
           }
@@ -522,7 +622,12 @@ async function main() {
       rooms: rooms.size,
       peers: [...rooms.values()].reduce((n, r) => n + r.peerCount, 0),
       workers: workers.length,
-      announcedIp: ANNOUNCED_IP || null,
+      ice: {
+        mode: 'ice-lite',
+        listenIp: LISTEN_IP,
+        announcedAddress: ANNOUNCED_ADDRESS,
+        rtcPorts: `${RTC_MIN_PORT}-${RTC_MAX_PORT}`,
+      },
       uptime: Math.round(process.uptime()),
     });
   });
@@ -540,8 +645,11 @@ async function main() {
     console.log(`\n  WebRTC Room SFU  http://0.0.0.0:${PORT}`);
     console.log(`  WebSocket         /ws`);
     console.log(`  Health            /health`);
-    if (ANNOUNCED_IP) console.log(`  Announced IP      ${ANNOUNCED_IP}`);
-    else console.log(`  Announced IP      (none — set ANNOUNCED_IP for cloud/NAT)`);
+    console.log(`  ICE mode          ice-lite`);
+    console.log(`  Listen IP         ${LISTEN_IP}`);
+    console.log(
+      `  Announced         ${ANNOUNCED_ADDRESS || '(none — set ANNOUNCED_IP for cloud/NAT)'}`
+    );
     console.log(`  RTC ports         ${RTC_MIN_PORT}-${RTC_MAX_PORT}\n`);
   });
 
@@ -549,7 +657,9 @@ async function main() {
     console.log('\nShutting down…');
     server.close(() => {
       for (const w of workers) {
-        try { w.close(); } catch (_) {}
+        try {
+          w.close();
+        } catch (_) {}
       }
       process.exit(0);
     });
