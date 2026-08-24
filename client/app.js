@@ -1,6 +1,6 @@
 /**
  * WebRTC Room client (mediasoup-client)
- * Fixed: XSS escape, transport construction, audio-only peers, guards, cleanup
+ * ICE: SFU host candidates + optional iceServers (STUN/TURN) from server
  */
 (() => {
   'use strict';
@@ -12,6 +12,12 @@
     return;
   }
   const { Device } = ms;
+
+  // Default STUN when server sends no ICE_SERVERS (low value for ICE-Lite SFU, harmless)
+  const DEFAULT_ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => [...document.querySelectorAll(sel)];
@@ -67,6 +73,7 @@
   let pingTimer = null;
   let meterTimer = null;
   let joining = false;
+  let iceServers = DEFAULT_ICE_SERVERS.slice();
 
   const peers = new Map();
   const consumers = new Map();
@@ -74,12 +81,15 @@
   let requestSeq = 0;
   const pending = new Map();
 
-  function toast(msg, ms = 2800) {
+  function toast(msg, ms) {
+    ms = ms || 2800;
     const el = document.createElement('div');
     el.className = 'toast';
     el.textContent = msg;
     toasts.appendChild(el);
-    setTimeout(() => el.remove(), ms);
+    setTimeout(function () {
+      el.remove();
+    }, ms);
   }
 
   function genRoomId() {
@@ -90,7 +100,6 @@
     return new URLSearchParams(location.search).get(name);
   }
 
-  // Safe HTML escape via DOM (no entity literals that get corrupted in tooling)
   function escapeHtml(s) {
     const d = document.createElement('div');
     d.textContent = String(s);
@@ -101,9 +110,14 @@
     const fromQuery = qs('sfu');
     if (fromQuery) return fromQuery;
     const stored = localStorage.getItem('sfuUrl');
-    if (stored) return stored.includes('/ws') ? stored : stored.replace(/\/?$/, '') + '/ws';
+    if (stored) return stored.indexOf('/ws') !== -1 ? stored : stored.replace(/\/?$/, '') + '/ws';
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return proto + '//' + location.host + '/ws';
+  }
+
+  function resolveIceServers(fromServer) {
+    if (fromServer && fromServer.length) return fromServer;
+    return DEFAULT_ICE_SERVERS.slice();
   }
 
   function request(type, payload, timeoutMs) {
@@ -120,8 +134,7 @@
         reject(new Error('Timeout: ' + type));
       }, timeoutMs);
       pending.set(requestId, { resolve: resolve, reject: reject, timer: timer });
-      var body = Object.assign({ type: type, requestId: requestId }, payload);
-      ws.send(JSON.stringify(body));
+      ws.send(JSON.stringify(Object.assign({ type: type, requestId: requestId }, payload)));
     });
   }
 
@@ -298,6 +311,8 @@
       peerId = joined.peerId;
       roomId = joined.roomId;
       displayName = joined.displayName;
+      iceServers = resolveIceServers(joined.iceServers);
+      console.log('[ice] iceServers', iceServers.length, joined.ice || {});
 
       device = new Device();
       await device.load({ routerRtpCapabilities: joined.rtpCapabilities });
@@ -369,13 +384,22 @@
 
   async function createTransport(direction) {
     var info = await request('createWebRtcTransport', { direction: direction });
-    // Only pass mediasoup-required fields (ignore type/requestId)
+    if (info.iceServers && info.iceServers.length) {
+      iceServers = info.iceServers;
+    }
     var opts = {
       id: info.id,
       iceParameters: info.iceParameters,
       iceCandidates: info.iceCandidates,
       dtlsParameters: info.dtlsParameters,
+      iceServers: iceServers,
     };
+    console.log(
+      '[ice] create ' + direction + ' transport candidates=',
+      (info.iceCandidates || []).map(function (c) {
+        return c.ip + ':' + c.port + '/' + c.protocol;
+      })
+    );
     var transport =
       direction === 'send' ? device.createSendTransport(opts) : device.createRecvTransport(opts);
 
@@ -406,10 +430,18 @@
     }
 
     transport.on('connectionstatechange', function (state) {
+      console.log('[ice] transport ' + direction + ' connectionState=' + state);
       if (state === 'failed' || state === 'closed') {
         console.warn('Transport ' + direction + ':', state);
       }
     });
+    if (typeof transport.on === 'function') {
+      try {
+        transport.on('icegatheringstatechange', function (state) {
+          console.log('[ice] transport ' + direction + ' iceGatheringState=' + state);
+        });
+      } catch (e) {}
+    }
     return transport;
   }
 
@@ -434,9 +466,7 @@
       producerToConsumer.set(producerId, consumer.id);
       var peer = peers.get(remotePeerId);
       if (peer) peer.consumers.set(consumer.id, consumer);
-
-      var source = appData.source || kind;
-      attachRemoteTrack(remotePeerId, remoteName, consumer.track, source, kind);
+      attachRemoteTrack(remotePeerId, remoteName, consumer.track, appData.source || kind, kind);
       await request('resumeConsumer', { consumerId: consumer.id });
       updateParticipants();
       applySpeaker();
@@ -462,7 +492,6 @@
     var peer = peers.get(remotePeerId);
     if (!peer) return;
 
-    // Audio-only (mic): play via <audio>, optional avatar tile without black video
     if (kind === 'audio' || source === 'mic') {
       if (!peer.audioEl) {
         peer.audioEl = document.createElement('audio');
@@ -481,8 +510,6 @@
       });
       aStream.addTrack(track);
       peer.audioEl.play().catch(function () {});
-
-      // Ensure a visible tile for audio-only peers
       if (!peer.tiles.has('camera') && !peer.tiles.has('screen')) {
         ensureAvatarTile(remotePeerId, remoteName);
       }
@@ -507,7 +534,6 @@
       tile.querySelector('.remote-name').textContent = remoteName;
       videosGrid.appendChild(tile);
       peer.tiles.set(tileKey, tile);
-      // Remove placeholder avatar if present
       if (peer.tiles.has('avatar')) {
         peer.tiles.get('avatar').remove();
         peer.tiles.delete('avatar');
@@ -580,10 +606,8 @@
       consumer.close();
     } catch (e) {}
     consumers.delete(consumerId);
-
     peers.forEach(function (peer) {
       peer.consumers.delete(consumerId);
-      // Clean empty tiles
       peer.tiles.forEach(function (tile, source) {
         var video = tile.querySelector('video');
         var stream = video && video.srcObject;
@@ -634,14 +658,12 @@
     mediaRecorder = null;
     recordedChunks = [];
     recordingIndicator.classList.add('hidden');
-
     [audioProducer, videoProducer, screenProducer].forEach(function (p) {
       try {
         if (p) p.close();
       } catch (e) {}
     });
     audioProducer = videoProducer = screenProducer = null;
-
     try {
       if (sendTransport) sendTransport.close();
     } catch (e) {}
@@ -649,7 +671,6 @@
       if (recvTransport) recvTransport.close();
     } catch (e) {}
     sendTransport = recvTransport = null;
-
     consumers.forEach(function (c) {
       try {
         c.close();
@@ -657,7 +678,6 @@
     });
     consumers.clear();
     producerToConsumer.clear();
-
     peers.forEach(function (peer) {
       peer.tiles.forEach(function (tile) {
         tile.remove();
@@ -669,7 +689,6 @@
       }
     });
     peers.clear();
-
     if (localStream) {
       localStream.getTracks().forEach(function (t) {
         t.stop();
@@ -684,6 +703,7 @@
     }
     localVideo.srcObject = null;
     device = null;
+    iceServers = DEFAULT_ICE_SERVERS.slice();
   }
 
   function leaveRoom(fromClose) {
@@ -898,6 +918,7 @@
       var lines = [];
       try {
         if (sendTransport) {
+          lines.push('send state: ' + (sendTransport.connectionState || '?'));
           (await sendTransport.getStats()).forEach(function (r) {
             if (r.type === 'outbound-rtp' && !r.isRemote) {
               lines.push('↑ ' + r.kind + ': ' + Math.round((r.bytesSent || 0) / 1024) + ' KB');
@@ -905,6 +926,7 @@
           });
         }
         if (recvTransport) {
+          lines.push('recv state: ' + (recvTransport.connectionState || '?'));
           (await recvTransport.getStats()).forEach(function (r) {
             if (r.type === 'inbound-rtp' && !r.isRemote) {
               lines.push(
@@ -918,6 +940,7 @@
             }
           });
         }
+        lines.push('iceServers: ' + iceServers.length);
       } catch (e) {}
       if (lines.length) {
         statsContent.textContent = '';
@@ -999,7 +1022,6 @@
       var newStream = await navigator.mediaDevices.getUserMedia(constraints);
       var newAudio = newStream.getAudioTracks()[0];
       var newVideo = newStream.getVideoTracks()[0];
-
       if (newAudio && audioProducer) {
         await audioProducer.replaceTrack({ track: newAudio });
         localStream.getAudioTracks().forEach(function (t) {
@@ -1026,7 +1048,6 @@
           appData: { source: 'camera' },
         });
       }
-
       localVideo.srcObject = localStream;
       applyMicCamState();
       startLocalMeter();
