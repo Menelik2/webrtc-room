@@ -23,9 +23,12 @@
           <label>Room ID <span class="hint">(blank = create new)</span>
             <input type="text" id="room-id" placeholder="e.g. team-standup" maxlength="32" autocomplete="off" />
           </label>
+          <label>Room PIN <span class="hint">(optional)</span>
+            <input type="password" id="room-pin" placeholder="Leave blank for open room" maxlength="32" autocomplete="off" />
+          </label>
           <button type="submit" class="btn primary" id="join-btn">Join Room</button>
         </form>
-        <p class="footer-note">Point SFU with <code>?sfu=wss://host/ws</code> if the UI is hosted separately (e.g. Vercel)</p>
+        <p class="footer-note">Shortcuts in call: <kbd>M</kbd> mic · <kbd>C</kbd> cam · <kbd>S</kbd> share · Point SFU with <code>?sfu=wss://host/ws</code> if UI is on Vercel</p>
       </div>
     </section>
 
@@ -95,13 +98,13 @@
       <div id="floating-reactions"></div>
 
       <footer class="controls">
-        <button type="button" id="toggle-mic" class="ctrl-btn" title="Microphone">
+        <button type="button" id="toggle-mic" class="ctrl-btn" title="Microphone (M)">
           <span class="icon">🎤</span><span class="label">Mic</span>
         </button>
-        <button type="button" id="toggle-cam" class="ctrl-btn" title="Camera">
+        <button type="button" id="toggle-cam" class="ctrl-btn" title="Camera (C)">
           <span class="icon">📷</span><span class="label">Cam</span>
         </button>
-        <button type="button" id="toggle-screen" class="ctrl-btn" title="Share screen">
+        <button type="button" id="toggle-screen" class="ctrl-btn" title="Share screen (S)">
           <span class="icon">🖥️</span><span class="label">Share</span>
         </button>
         <button type="button" id="toggle-noise" class="ctrl-btn" title="Noise suppression">
