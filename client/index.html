@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="description" content="Private WebRTC voice, video and screen sharing rooms powered by mediasoup SFU" />
+  <meta name="theme-color" content="#0f1117" />
   <title>WebRTC Room</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📹</text></svg>" />
   <link rel="stylesheet" href="style.css" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 </head>
@@ -15,27 +18,29 @@
         <p class="subtitle">Private peer-to-peer voice, video and screen sharing</p>
         <form id="join-form">
           <label>Display Name
-            <input type="text" id="display-name" placeholder="Your name" maxlength="32" required />
+            <input type="text" id="display-name" placeholder="Your name" maxlength="32" required autocomplete="name" />
           </label>
           <label>Room ID <span class="hint">(blank = create new)</span>
-            <input type="text" id="room-id" placeholder="e.g. team-standup" maxlength="32" />
+            <input type="text" id="room-id" placeholder="e.g. team-standup" maxlength="32" autocomplete="off" />
           </label>
           <button type="submit" class="btn primary" id="join-btn">Join Room</button>
         </form>
-        <p class="footer-note">Point SFU with ?sfu=wss://host if UI is on Vercel</p>
+        <p class="footer-note">Point SFU with <code>?sfu=wss://host/ws</code> if the UI is hosted separately (e.g. Vercel)</p>
       </div>
     </section>
+
     <section id="call" class="hidden">
       <header class="top-bar">
         <div class="room-info">
           <span class="room-label">Room</span>
           <strong id="current-room">—</strong>
-          <button id="copy-room" class="icon-btn" title="Copy Room ID">📋</button>
-          <button id="copy-invite" class="icon-btn" title="Copy invite link">🔗</button>
+          <button type="button" id="copy-room" class="icon-btn" title="Copy Room ID" aria-label="Copy room ID">📋</button>
+          <button type="button" id="copy-invite" class="icon-btn" title="Copy invite link" aria-label="Copy invite link">🔗</button>
         </div>
         <div class="peer-count"><span id="peer-count">1</span> in call</div>
-        <button id="leave-btn" class="btn danger small">Leave</button>
+        <button type="button" id="leave-btn" class="btn danger small">Leave</button>
       </header>
+
       <main class="videos-area">
         <div id="videos-grid" class="videos-grid">
           <div class="video-tile local" id="local-tile">
@@ -50,57 +55,105 @@
           </div>
         </div>
       </main>
+
       <aside id="participants-panel" class="side-panel hidden">
-        <div class="panel-header"><h3>Participants</h3><button class="icon-btn close-panel" data-panel="participants-panel">✕</button></div>
+        <div class="panel-header">
+          <h3>Participants</h3>
+          <button type="button" class="icon-btn close-panel" data-panel="participants-panel" aria-label="Close">✕</button>
+        </div>
         <ul id="participants-list" class="participants-list"></ul>
       </aside>
+
       <aside id="chat-panel" class="side-panel chat-panel hidden">
-        <div class="panel-header"><h3>Chat</h3><button class="icon-btn close-panel" data-panel="chat-panel">✕</button></div>
+        <div class="panel-header">
+          <h3>Chat</h3>
+          <button type="button" class="icon-btn close-panel" data-panel="chat-panel" aria-label="Close">✕</button>
+        </div>
         <div id="chat-messages" class="chat-messages"></div>
         <form id="chat-form" class="chat-input-row">
-          <input type="text" id="chat-input" placeholder="Type a message…" maxlength="500" />
+          <input type="text" id="chat-input" placeholder="Type a message…" maxlength="500" autocomplete="off" />
           <button type="submit" class="btn primary small">Send</button>
         </form>
       </aside>
+
       <aside id="stats-panel" class="side-panel stats-panel hidden">
-        <div class="panel-header"><h3>Network</h3><button class="icon-btn close-panel" data-panel="stats-panel">✕</button></div>
+        <div class="panel-header">
+          <h3>Network</h3>
+          <button type="button" class="icon-btn close-panel" data-panel="stats-panel" aria-label="Close">✕</button>
+        </div>
         <div id="stats-content" class="stats-content"><p class="muted">Collecting…</p></div>
       </aside>
-      <div id="reactions-bar" class="reactions-bar hidden">
-        <button data-emoji="👍">👍</button><button data-emoji="👏">👏</button><button data-emoji="❤️">❤️</button>
-        <button data-emoji="😂">😂</button><button data-emoji="🎉">🎉</button><button data-emoji="✋">✋</button>
+
+      <div id="reactions-bar" class="reactions-bar hidden" role="toolbar" aria-label="Reactions">
+        <button type="button" data-emoji="👍">👍</button>
+        <button type="button" data-emoji="👏">👏</button>
+        <button type="button" data-emoji="❤️">❤️</button>
+        <button type="button" data-emoji="😂">😂</button>
+        <button type="button" data-emoji="🎉">🎉</button>
+        <button type="button" data-emoji="✋">✋</button>
       </div>
       <div id="floating-reactions"></div>
+
       <footer class="controls">
-        <button id="toggle-mic" class="ctrl-btn"><span class="icon">🎤</span><span class="label">Mic</span></button>
-        <button id="toggle-cam" class="ctrl-btn"><span class="icon">📷</span><span class="label">Cam</span></button>
-        <button id="toggle-screen" class="ctrl-btn"><span class="icon">🖥️</span><span class="label">Share</span></button>
-        <button id="toggle-noise" class="ctrl-btn"><span class="icon">🎧</span><span class="label">Noise</span></button>
-        <button id="toggle-record" class="ctrl-btn"><span class="icon">⏺️</span><span class="label">Record</span></button>
-        <button id="toggle-reactions" class="ctrl-btn"><span class="icon">😊</span><span class="label">React</span></button>
-        <button id="toggle-participants" class="ctrl-btn"><span class="icon">👥</span><span class="label">People</span></button>
-        <button id="toggle-chat" class="ctrl-btn"><span class="icon">💬</span><span class="label">Chat</span></button>
-        <button id="toggle-stats" class="ctrl-btn"><span class="icon">📊</span><span class="label">Stats</span></button>
-        <button id="toggle-settings" class="ctrl-btn"><span class="icon">⚙️</span><span class="label">Settings</span></button>
+        <button type="button" id="toggle-mic" class="ctrl-btn" title="Microphone">
+          <span class="icon">🎤</span><span class="label">Mic</span>
+        </button>
+        <button type="button" id="toggle-cam" class="ctrl-btn" title="Camera">
+          <span class="icon">📷</span><span class="label">Cam</span>
+        </button>
+        <button type="button" id="toggle-screen" class="ctrl-btn" title="Share screen">
+          <span class="icon">🖥️</span><span class="label">Share</span>
+        </button>
+        <button type="button" id="toggle-noise" class="ctrl-btn" title="Noise suppression">
+          <span class="icon">🎧</span><span class="label">Noise</span>
+        </button>
+        <button type="button" id="toggle-record" class="ctrl-btn" title="Record">
+          <span class="icon">⏺️</span><span class="label">Record</span>
+        </button>
+        <button type="button" id="toggle-reactions" class="ctrl-btn" title="Reactions">
+          <span class="icon">😊</span><span class="label">React</span>
+        </button>
+        <button type="button" id="toggle-participants" class="ctrl-btn" title="Participants">
+          <span class="icon">👥</span><span class="label">People</span>
+        </button>
+        <button type="button" id="toggle-chat" class="ctrl-btn" title="Chat">
+          <span class="icon">💬</span><span class="label">Chat</span>
+        </button>
+        <button type="button" id="toggle-stats" class="ctrl-btn" title="Network stats">
+          <span class="icon">📊</span><span class="label">Stats</span>
+        </button>
+        <button type="button" id="toggle-settings" class="ctrl-btn" title="Settings">
+          <span class="icon">⚙️</span><span class="label">Settings</span>
+        </button>
       </footer>
     </section>
-    <div id="settings-modal" class="modal hidden">
+
+    <div id="settings-modal" class="modal hidden" role="dialog" aria-label="Settings">
       <div class="modal-card">
-        <div class="modal-header"><h2>Settings</h2><button id="close-settings" class="icon-btn">✕</button></div>
+        <div class="modal-header">
+          <h2>Settings</h2>
+          <button type="button" id="close-settings" class="icon-btn" aria-label="Close">✕</button>
+        </div>
         <div class="modal-body">
           <label>Camera<select id="select-camera"></select></label>
           <label>Microphone<select id="select-mic"></select></label>
           <label>Speaker<select id="select-speaker"></select></label>
-          <label class="checkbox-row"><input type="checkbox" id="mirror-local" checked /> Mirror video</label>
+          <label class="checkbox-row"><input type="checkbox" id="mirror-local" checked /> Mirror local video</label>
           <label>Display name<input type="text" id="settings-name" maxlength="32" /></label>
           <label>SFU URL<input type="text" id="settings-sfu-url" placeholder="wss://sfu.example.com" /></label>
         </div>
-        <div class="modal-footer"><button id="apply-settings" class="btn primary">Apply</button></div>
+        <div class="modal-footer">
+          <button type="button" id="apply-settings" class="btn primary">Apply</button>
+        </div>
       </div>
     </div>
-    <div id="toasts"></div>
-    <div id="recording-indicator" class="recording-indicator hidden"><span class="rec-dot"></span> Recording…</div>
+
+    <div id="toasts" aria-live="polite"></div>
+    <div id="recording-indicator" class="recording-indicator hidden">
+      <span class="rec-dot"></span> Recording…
+    </div>
   </div>
+
   <script src="https://cdn.jsdelivr.net/npm/mediasoup-client@3/build/mediasoup-client.min.js"></script>
   <script src="app.js"></script>
 </body>
