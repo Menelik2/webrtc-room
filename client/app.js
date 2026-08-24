@@ -1,15 +1,17 @@
 /**
- * WebRTC Room — client (mediasoup-client)
+ * WebRTC Room client (mediasoup-client)
+ * Fixed: XSS escape, transport construction, audio-only peers, guards, cleanup
  */
 (() => {
   'use strict';
 
-  const { Device } = window.mediasoupClient || {};
-  if (!Device) {
+  const ms = window.mediasoupClient;
+  if (!ms || !ms.Device) {
     document.body.innerHTML =
-      '<p style="color:#fff;padding:2rem;font-family:system-ui">Failed to load mediasoup-client.</p>';
+      '<p style="color:#fff;padding:2rem;font-family:system-ui">Failed to load mediasoup-client CDN.</p>';
     return;
   }
+  const { Device } = ms;
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => [...document.querySelectorAll(sel)];
@@ -64,6 +66,7 @@
   let statsTimer = null;
   let pingTimer = null;
   let meterTimer = null;
+  let joining = false;
 
   const peers = new Map();
   const consumers = new Map();
@@ -87,12 +90,11 @@
     return new URLSearchParams(location.search).get(name);
   }
 
+  // Safe HTML escape via DOM (no entity literals that get corrupted in tooling)
   function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, '&')
-      .replace(/</g, '<')
-      .replace(/>/g, '>')
-      .replace(/"/g, '"');
+    const d = document.createElement('div');
+    d.textContent = String(s);
+    return d.innerHTML;
   }
 
   function defaultSfuUrl() {
@@ -101,32 +103,35 @@
     const stored = localStorage.getItem('sfuUrl');
     if (stored) return stored.includes('/ws') ? stored : stored.replace(/\/?$/, '') + '/ws';
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${location.host}/ws`;
+    return proto + '//' + location.host + '/ws';
   }
 
-  function request(type, payload = {}, timeoutMs = 15000) {
-    return new Promise((resolve, reject) => {
+  function request(type, payload, timeoutMs) {
+    payload = payload || {};
+    timeoutMs = timeoutMs || 15000;
+    return new Promise(function (resolve, reject) {
       if (!ws || ws.readyState !== 1) {
         reject(new Error('Not connected'));
         return;
       }
-      const requestId = `r${++requestSeq}`;
-      const timer = setTimeout(() => {
+      var requestId = 'r' + ++requestSeq;
+      var timer = setTimeout(function () {
         pending.delete(requestId);
-        reject(new Error(`Timeout: ${type}`));
+        reject(new Error('Timeout: ' + type));
       }, timeoutMs);
-      pending.set(requestId, { resolve, reject, timer });
-      ws.send(JSON.stringify({ type, requestId, ...payload }));
+      pending.set(requestId, { resolve: resolve, reject: reject, timer: timer });
+      var body = Object.assign({ type: type, requestId: requestId }, payload);
+      ws.send(JSON.stringify(body));
     });
   }
 
   function handleServerMessage(msg) {
     if (msg.requestId && pending.has(msg.requestId)) {
-      const { resolve, reject, timer } = pending.get(msg.requestId);
+      var p = pending.get(msg.requestId);
       pending.delete(msg.requestId);
-      clearTimeout(timer);
-      if (msg.type === 'error') reject(new Error(msg.error || 'error'));
-      else resolve(msg);
+      clearTimeout(p.timer);
+      if (msg.type === 'error') p.reject(new Error(msg.error || 'error'));
+      else p.resolve(msg);
       return;
     }
     switch (msg.type) {
@@ -134,13 +139,13 @@
         ensurePeer(msg.peer.id, msg.peer.displayName);
         updatePeerCount();
         updateParticipants();
-        toast(`${msg.peer.displayName} joined`);
+        toast(msg.peer.displayName + ' joined');
         break;
       case 'peerLeft':
         removePeer(msg.peerId);
         updatePeerCount();
         updateParticipants();
-        toast(`${msg.displayName || 'Someone'} left`);
+        toast((msg.displayName || 'Someone') + ' left');
         break;
       case 'peerUpdated':
         if (peers.has(msg.peerId)) {
@@ -150,7 +155,7 @@
         }
         break;
       case 'newProducer':
-        consumeProducer(msg.producerId, msg.peerId, msg.displayName, msg.kind, msg.appData);
+        consumeProducer(msg.producerId, msg.peerId, msg.displayName, msg.kind, msg.appData || {});
         break;
       case 'producerClosed':
         closeConsumerForProducer(msg.producerId);
@@ -170,70 +175,54 @@
   }
 
   function connectWs(url) {
-    return new Promise((resolve, reject) => {
-      const socket = new WebSocket(url);
-      const t = setTimeout(() => {
+    return new Promise(function (resolve, reject) {
+      var socket = new WebSocket(url);
+      var t = setTimeout(function () {
         socket.close();
         reject(new Error('WebSocket connect timeout'));
       }, 10000);
-      socket.onopen = () => {
+      socket.onopen = function () {
         clearTimeout(t);
         ws = socket;
         resolve();
       };
-      socket.onerror = () => {
+      socket.onerror = function () {
         clearTimeout(t);
         reject(new Error('WebSocket error — is the SFU running?'));
       };
-      socket.onmessage = (ev) => {
+      socket.onmessage = function (ev) {
         try {
           handleServerMessage(JSON.parse(ev.data));
         } catch (e) {
           console.warn('bad message', e);
         }
       };
-      socket.onclose = () => {
-        if (call && !call.classList.contains('hidden')) {
+      socket.onclose = function () {
+        ws = null;
+        if (!joining && call && !call.classList.contains('hidden')) {
           toast('Disconnected from SFU');
           leaveRoom(true);
         }
-        ws = null;
       };
     });
   }
 
-  async function getLocalMedia(deviceIds = {}) {
-    const audio =
-      deviceIds.audioId != null
-        ? {
-            deviceId: { exact: deviceIds.audioId },
-            echoCancellation: true,
-            noiseSuppression: noiseSuppression,
-            autoGainControl: true,
-          }
-        : {
-            echoCancellation: true,
-            noiseSuppression: noiseSuppression,
-            autoGainControl: true,
-          };
-    const video =
-      deviceIds.videoId != null
-        ? {
-            deviceId: { exact: deviceIds.videoId },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            frameRate: { ideal: 30 },
-          }
-        : {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            frameRate: { ideal: 30 },
-          };
+  async function getLocalMedia() {
+    var audio = {
+      echoCancellation: true,
+      noiseSuppression: noiseSuppression,
+      autoGainControl: true,
+    };
+    var video = {
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 30 },
+    };
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio, video });
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: audio, video: video });
     } catch (e) {
       console.warn('Cam failed, audio only', e);
-      localStream = await navigator.mediaDevices.getUserMedia({ audio });
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: audio });
       camEnabled = false;
     }
     localVideo.srcObject = localStream;
@@ -244,35 +233,42 @@
 
   function applyMicCamState() {
     if (!localStream) return;
-    localStream.getAudioTracks().forEach((t) => (t.enabled = micEnabled));
-    localStream.getVideoTracks().forEach((t) => (t.enabled = camEnabled));
+    localStream.getAudioTracks().forEach(function (t) {
+      t.enabled = micEnabled;
+    });
+    localStream.getVideoTracks().forEach(function (t) {
+      t.enabled = camEnabled;
+    });
     localMuted.classList.toggle('hidden', micEnabled);
-    $('#toggle-mic')?.classList.toggle('danger-active', !micEnabled);
-    $('#toggle-cam')?.classList.toggle('danger-active', !camEnabled);
+    var micBtn = $('#toggle-mic');
+    var camBtn = $('#toggle-cam');
+    if (micBtn) micBtn.classList.toggle('danger-active', !micEnabled);
+    if (camBtn) camBtn.classList.toggle('danger-active', !camEnabled);
   }
 
   function startLocalMeter() {
     stopLocalMeter();
-    const bar = document.querySelector('#local-meter .meter-bar');
-    if (!bar || !localStream?.getAudioTracks().length) return;
+    var bar = document.querySelector('#local-meter .meter-bar');
+    if (!bar || !localStream || !localStream.getAudioTracks().length) return;
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const source = ctx.createMediaStreamSource(localStream);
-      const analyser = ctx.createAnalyser();
+      var AC = window.AudioContext || window.webkitAudioContext;
+      var ctx = new AC();
+      var source = ctx.createMediaStreamSource(localStream);
+      var analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
       source.connect(analyser);
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      meterTimer = setInterval(() => {
+      var data = new Uint8Array(analyser.frequencyBinCount);
+      meterTimer = setInterval(function () {
         if (!micEnabled) {
           bar.style.height = '0%';
           return;
         }
         analyser.getByteFrequencyData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) sum += data[i];
+        var sum = 0;
+        for (var i = 0; i < data.length; i++) sum += data[i];
         bar.style.height = Math.min(100, Math.round((sum / data.length / 255) * 140)) + '%';
       }, 80);
-    } catch (_) {}
+    } catch (e) {}
   }
 
   function stopLocalMeter() {
@@ -283,22 +279,21 @@
   async function joinRoom(name, rid, pin) {
     joinBtn.disabled = true;
     joinBtn.textContent = 'Connecting…';
+    joining = true;
     try {
       displayName = name;
       roomId = rid || genRoomId();
 
-      let sfuUrl = settingsSfuUrl.value.trim() || defaultSfuUrl();
+      var sfuUrl = (settingsSfuUrl.value || '').trim() || defaultSfuUrl();
       if (!sfuUrl) throw new Error('SFU URL required');
-      if (!sfuUrl.includes('/ws')) sfuUrl = sfuUrl.replace(/\/?$/, '') + '/ws';
+      if (sfuUrl.indexOf('/ws') === -1) sfuUrl = sfuUrl.replace(/\/?$/, '') + '/ws';
       localStorage.setItem('sfuUrl', sfuUrl.replace(/\/ws$/, ''));
 
       await connectWs(sfuUrl);
 
-      const joined = await request('join', {
-        roomId,
-        displayName: name,
-        pin: pin || undefined,
-      });
+      var joinPayload = { roomId: roomId, displayName: name };
+      if (pin) joinPayload.pin = pin;
+      var joined = await request('join', joinPayload);
 
       peerId = joined.peerId;
       roomId = joined.roomId;
@@ -330,9 +325,13 @@
         });
       }
 
-      for (const p of joined.peers || []) ensurePeer(p.id, p.displayName);
-      for (const ep of joined.existingProducers || []) {
-        await consumeProducer(ep.producerId, ep.peerId, ep.displayName, ep.kind, ep.appData);
+      (joined.peers || []).forEach(function (p) {
+        ensurePeer(p.id, p.displayName);
+      });
+      var eps = joined.existingProducers || [];
+      for (var i = 0; i < eps.length; i++) {
+        var ep = eps[i];
+        await consumeProducer(ep.producerId, ep.peerId, ep.displayName, ep.kind, ep.appData || {});
       }
 
       localName.textContent = displayName;
@@ -344,76 +343,88 @@
       startStats();
       startPing();
 
-      const u = new URL(location.href);
+      var u = new URL(location.href);
       u.searchParams.set('room', roomId);
       history.replaceState(null, '', u);
-      toast(`Joined room ${roomId}${joined.hasPin ? ' (PIN)' : ''}`);
+      toast('Joined room ' + roomId + (joined.hasPin ? ' (PIN)' : ''));
     } catch (err) {
       console.error(err);
-      const msg =
-        err.message === 'invalid_pin'
-          ? 'Wrong room PIN'
-          : err.message === 'room_full'
-            ? 'Room is full'
-            : err.message || 'Join failed';
+      var msg = err.message || 'Join failed';
+      if (msg === 'invalid_pin') msg = 'Wrong room PIN';
+      else if (msg === 'room_full') msg = 'Room is full';
       toast(msg);
       cleanupMedia();
       if (ws) {
-        try { ws.close(); } catch (_) {}
+        try {
+          ws.close();
+        } catch (e) {}
         ws = null;
       }
     } finally {
+      joining = false;
       joinBtn.disabled = false;
       joinBtn.textContent = 'Join Room';
     }
   }
 
   async function createTransport(direction) {
-    const info = await request('createWebRtcTransport', { direction });
-    const transport =
-      direction === 'send'
-        ? device.createSendTransport(info)
-        : device.createRecvTransport(info);
+    var info = await request('createWebRtcTransport', { direction: direction });
+    // Only pass mediasoup-required fields (ignore type/requestId)
+    var opts = {
+      id: info.id,
+      iceParameters: info.iceParameters,
+      iceCandidates: info.iceCandidates,
+      dtlsParameters: info.dtlsParameters,
+    };
+    var transport =
+      direction === 'send' ? device.createSendTransport(opts) : device.createRecvTransport(opts);
 
-    transport.on('connect', ({ dtlsParameters }, callback, errback) => {
-      request('connectWebRtcTransport', { transportId: transport.id, dtlsParameters })
-        .then(() => callback())
+    transport.on('connect', function (params, callback, errback) {
+      request('connectWebRtcTransport', {
+        transportId: transport.id,
+        dtlsParameters: params.dtlsParameters,
+      })
+        .then(function () {
+          callback();
+        })
         .catch(errback);
     });
 
     if (direction === 'send') {
-      transport.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
-        try {
-          const { id } = await request('produce', {
-            transportId: transport.id,
-            kind,
-            rtpParameters,
-            appData,
-          });
-          callback({ id });
-        } catch (e) {
-          errback(e);
-        }
+      transport.on('produce', function (params, callback, errback) {
+        request('produce', {
+          transportId: transport.id,
+          kind: params.kind,
+          rtpParameters: params.rtpParameters,
+          appData: params.appData,
+        })
+          .then(function (res) {
+            callback({ id: res.id });
+          })
+          .catch(errback);
       });
     }
 
-    transport.on('connectionstatechange', (state) => {
-      if (state === 'failed' || state === 'closed') console.warn(`Transport ${direction}:`, state);
+    transport.on('connectionstatechange', function (state) {
+      if (state === 'failed' || state === 'closed') {
+        console.warn('Transport ' + direction + ':', state);
+      }
     });
     return transport;
   }
 
-  async function consumeProducer(producerId, remotePeerId, remoteName, kind, appData = {}) {
+  async function consumeProducer(producerId, remotePeerId, remoteName, kind, appData) {
+    appData = appData || {};
     if (!device || !recvTransport) return;
     if (producerToConsumer.has(producerId)) return;
     ensurePeer(remotePeerId, remoteName);
     try {
-      const consumed = await request('consume', {
+      var consumed = await request('consume', {
         transportId: recvTransport.id,
-        producerId,
+        producerId: producerId,
         rtpCapabilities: device.rtpCapabilities,
       });
-      const consumer = await recvTransport.consume({
+      var consumer = await recvTransport.consume({
         id: consumed.id,
         producerId: consumed.producerId,
         kind: consumed.kind,
@@ -421,9 +432,11 @@
       });
       consumers.set(consumer.id, consumer);
       producerToConsumer.set(producerId, consumer.id);
-      const peer = peers.get(remotePeerId);
+      var peer = peers.get(remotePeerId);
       if (peer) peer.consumers.set(consumer.id, consumer);
-      attachRemoteTrack(remotePeerId, remoteName, consumer.track, (appData && appData.source) || kind);
+
+      var source = appData.source || kind;
+      attachRemoteTrack(remotePeerId, remoteName, consumer.track, source, kind);
       await request('resumeConsumer', { consumerId: consumer.id });
       updateParticipants();
       applySpeaker();
@@ -434,88 +447,177 @@
 
   function ensurePeer(id, name) {
     if (!peers.has(id)) {
-      peers.set(id, { displayName: name || 'Guest', tiles: new Map(), consumers: new Map() });
-    } else if (name) peers.get(id).displayName = name;
+      peers.set(id, {
+        displayName: name || 'Guest',
+        tiles: new Map(),
+        consumers: new Map(),
+        audioEl: null,
+      });
+    } else if (name) {
+      peers.get(id).displayName = name;
+    }
   }
 
-  function attachRemoteTrack(remotePeerId, remoteName, track, source) {
-    const peer = peers.get(remotePeerId);
+  function attachRemoteTrack(remotePeerId, remoteName, track, source, kind) {
+    var peer = peers.get(remotePeerId);
     if (!peer) return;
-    let tile = peer.tiles.get(source);
+
+    // Audio-only (mic): play via <audio>, optional avatar tile without black video
+    if (kind === 'audio' || source === 'mic') {
+      if (!peer.audioEl) {
+        peer.audioEl = document.createElement('audio');
+        peer.audioEl.autoplay = true;
+        peer.audioEl.playsInline = true;
+        peer.audioEl.style.display = 'none';
+        document.body.appendChild(peer.audioEl);
+      }
+      var aStream = peer.audioEl.srcObject;
+      if (!aStream) {
+        aStream = new MediaStream();
+        peer.audioEl.srcObject = aStream;
+      }
+      aStream.getAudioTracks().forEach(function (t) {
+        aStream.removeTrack(t);
+      });
+      aStream.addTrack(track);
+      peer.audioEl.play().catch(function () {});
+
+      // Ensure a visible tile for audio-only peers
+      if (!peer.tiles.has('camera') && !peer.tiles.has('screen')) {
+        ensureAvatarTile(remotePeerId, remoteName);
+      }
+      applySpeaker();
+      return;
+    }
+
+    var tileKey = source === 'screen' ? 'screen' : 'camera';
+    var tile = peer.tiles.get(tileKey);
     if (!tile) {
       tile = document.createElement('div');
       tile.className = 'video-tile remote';
       tile.dataset.peerId = remotePeerId;
-      tile.dataset.source = source;
-      tile.innerHTML = `<video autoplay playsinline></video>
-        <div class="tile-overlay"><div class="tile-label">
-          <span class="remote-name">${escapeHtml(remoteName)}</span>
-          <span class="source-badge">${source === 'screen' ? '🖥️' : ''}</span>
-        </div></div>`;
+      tile.dataset.source = tileKey;
+      tile.innerHTML =
+        '<video autoplay playsinline></video>' +
+        '<div class="tile-overlay"><div class="tile-label">' +
+        '<span class="remote-name"></span>' +
+        '<span class="source-badge">' +
+        (tileKey === 'screen' ? '🖥️' : '') +
+        '</span></div></div>';
+      tile.querySelector('.remote-name').textContent = remoteName;
       videosGrid.appendChild(tile);
-      peer.tiles.set(source, tile);
+      peer.tiles.set(tileKey, tile);
+      // Remove placeholder avatar if present
+      if (peer.tiles.has('avatar')) {
+        peer.tiles.get('avatar').remove();
+        peer.tiles.delete('avatar');
+      }
     }
-    const video = tile.querySelector('video');
-    let stream = video.srcObject;
+
+    var video = tile.querySelector('video');
+    var stream = video.srcObject;
     if (!stream) {
       stream = new MediaStream();
       video.srcObject = stream;
     }
-    stream.getTracks().filter((t) => t.kind === track.kind).forEach((t) => stream.removeTrack(t));
+    stream.getTracks().filter(function (t) {
+      return t.kind === track.kind;
+    }).forEach(function (t) {
+      stream.removeTrack(t);
+    });
     stream.addTrack(track);
-    video.play().catch(() => {});
+    video.play().catch(function () {});
     applySpeaker();
   }
 
+  function ensureAvatarTile(remotePeerId, remoteName) {
+    var peer = peers.get(remotePeerId);
+    if (!peer || peer.tiles.has('avatar') || peer.tiles.has('camera')) return;
+    var tile = document.createElement('div');
+    tile.className = 'video-tile remote';
+    tile.dataset.peerId = remotePeerId;
+    tile.dataset.source = 'avatar';
+    var initial = (remoteName || '?').charAt(0).toUpperCase();
+    tile.innerHTML =
+      '<div class="avatar-placeholder" style="display:flex;align-items:center;justify-content:center;height:100%;background:#1a1d27;font-size:3rem;font-weight:600;color:#5b8def">' +
+      escapeHtml(initial) +
+      '</div>' +
+      '<div class="tile-overlay"><div class="tile-label"><span class="remote-name"></span></div></div>';
+    tile.querySelector('.remote-name').textContent = remoteName;
+    videosGrid.appendChild(tile);
+    peer.tiles.set('avatar', tile);
+  }
+
   function applySpeaker() {
-    const id = selectSpeaker?.value;
+    var id = selectSpeaker && selectSpeaker.value;
     if (!id) return;
-    $$('.video-tile video').forEach((v) => {
-      if (typeof v.setSinkId === 'function') {
-        v.setSinkId(id).catch(() => {});
+    $$('video, audio').forEach(function (el) {
+      if (typeof el.setSinkId === 'function') {
+        el.setSinkId(id).catch(function () {});
       }
     });
   }
 
   function updatePeerLabels(id) {
-    const peer = peers.get(id);
+    var peer = peers.get(id);
     if (!peer) return;
-    for (const tile of peer.tiles.values()) {
-      const el = tile.querySelector('.remote-name');
+    peer.tiles.forEach(function (tile) {
+      var el = tile.querySelector('.remote-name');
       if (el) el.textContent = peer.displayName;
-    }
+    });
   }
 
   function closeConsumerForProducer(producerId) {
-    const cid = producerToConsumer.get(producerId);
+    var cid = producerToConsumer.get(producerId);
     if (cid) closeConsumer(cid);
     producerToConsumer.delete(producerId);
   }
 
   function closeConsumer(consumerId) {
-    const consumer = consumers.get(consumerId);
+    var consumer = consumers.get(consumerId);
     if (!consumer) return;
-    try { consumer.close(); } catch (_) {}
+    try {
+      consumer.close();
+    } catch (e) {}
     consumers.delete(consumerId);
-    for (const peer of peers.values()) {
+
+    peers.forEach(function (peer) {
       peer.consumers.delete(consumerId);
-      for (const [source, tile] of [...peer.tiles]) {
-        const stream = tile.querySelector('video')?.srcObject;
-        if (stream && stream.getTracks().filter((t) => t.readyState === 'live').length === 0) {
-          tile.remove();
-          peer.tiles.delete(source);
+      // Clean empty tiles
+      peer.tiles.forEach(function (tile, source) {
+        var video = tile.querySelector('video');
+        var stream = video && video.srcObject;
+        if (stream) {
+          var live = stream.getTracks().filter(function (t) {
+            return t.readyState === 'live';
+          });
+          if (live.length === 0) {
+            tile.remove();
+            peer.tiles.delete(source);
+          }
         }
-      }
-    }
+      });
+    });
   }
 
   function removePeer(id) {
-    const peer = peers.get(id);
+    var peer = peers.get(id);
     if (!peer) return;
-    for (const tile of peer.tiles.values()) tile.remove();
-    for (const c of peer.consumers.values()) {
-      try { c.close(); } catch (_) {}
+    peer.tiles.forEach(function (tile) {
+      tile.remove();
+    });
+    peer.consumers.forEach(function (c) {
+      try {
+        c.close();
+      } catch (e) {}
       consumers.delete(c.id);
+    });
+    if (peer.audioEl) {
+      try {
+        peer.audioEl.pause();
+        peer.audioEl.srcObject = null;
+        peer.audioEl.remove();
+      } catch (e) {}
     }
     peers.delete(id);
   }
@@ -525,52 +627,84 @@
     stopPing();
     stopLocalMeter();
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      try { mediaRecorder.stop(); } catch (_) {}
+      try {
+        mediaRecorder.stop();
+      } catch (e) {}
     }
     mediaRecorder = null;
     recordedChunks = [];
     recordingIndicator.classList.add('hidden');
-    [audioProducer, videoProducer, screenProducer].forEach((p) => {
-      try { p?.close(); } catch (_) {}
+
+    [audioProducer, videoProducer, screenProducer].forEach(function (p) {
+      try {
+        if (p) p.close();
+      } catch (e) {}
     });
     audioProducer = videoProducer = screenProducer = null;
-    try { sendTransport?.close(); } catch (_) {}
-    try { recvTransport?.close(); } catch (_) {}
+
+    try {
+      if (sendTransport) sendTransport.close();
+    } catch (e) {}
+    try {
+      if (recvTransport) recvTransport.close();
+    } catch (e) {}
     sendTransport = recvTransport = null;
-    for (const c of consumers.values()) {
-      try { c.close(); } catch (_) {}
-    }
+
+    consumers.forEach(function (c) {
+      try {
+        c.close();
+      } catch (e) {}
+    });
     consumers.clear();
     producerToConsumer.clear();
-    for (const peer of peers.values()) {
-      for (const tile of peer.tiles.values()) tile.remove();
-    }
+
+    peers.forEach(function (peer) {
+      peer.tiles.forEach(function (tile) {
+        tile.remove();
+      });
+      if (peer.audioEl) {
+        try {
+          peer.audioEl.remove();
+        } catch (e) {}
+      }
+    });
     peers.clear();
+
     if (localStream) {
-      localStream.getTracks().forEach((t) => t.stop());
+      localStream.getTracks().forEach(function (t) {
+        t.stop();
+      });
       localStream = null;
     }
     if (screenStream) {
-      screenStream.getTracks().forEach((t) => t.stop());
+      screenStream.getTracks().forEach(function (t) {
+        t.stop();
+      });
       screenStream = null;
     }
     localVideo.srcObject = null;
     device = null;
   }
 
-  function leaveRoom(fromClose = false) {
+  function leaveRoom(fromClose) {
     if (!fromClose && ws && ws.readyState === 1) {
-      try { ws.send(JSON.stringify({ type: 'leave' })); } catch (_) {}
+      try {
+        ws.send(JSON.stringify({ type: 'leave' }));
+      } catch (e) {}
     }
     cleanupMedia();
     if (ws) {
-      try { ws.close(); } catch (_) {}
+      try {
+        ws.close();
+      } catch (e) {}
       ws = null;
     }
     peerId = null;
     call.classList.add('hidden');
     lobby.classList.remove('hidden');
-    $$('.side-panel').forEach((p) => p.classList.add('hidden'));
+    $$('.side-panel').forEach(function (p) {
+      p.classList.add('hidden');
+    });
     reactionsBar.classList.add('hidden');
     settingsModal.classList.add('hidden');
   }
@@ -581,49 +715,66 @@
 
   function updateParticipants() {
     participantsList.innerHTML = '';
-    const add = (name, isLocal) => {
-      const li = document.createElement('li');
-      li.innerHTML = `<span>${escapeHtml(name)}${isLocal ? ' <span class="muted">(you)</span>' : ''}</span>`;
+    function add(name, isLocal) {
+      var li = document.createElement('li');
+      var span = document.createElement('span');
+      span.textContent = name + (isLocal ? ' (you)' : '');
+      li.appendChild(span);
       participantsList.appendChild(li);
-    };
+    }
     add(displayName, true);
-    for (const p of peers.values()) add(p.displayName, false);
+    peers.forEach(function (p) {
+      add(p.displayName, false);
+    });
   }
 
   function appendChat(name, text) {
-    const div = document.createElement('div');
+    var div = document.createElement('div');
     div.className = 'chat-msg';
-    div.innerHTML = `<div class="who">${escapeHtml(name)}</div><div class="body">${escapeHtml(text)}</div>`;
+    var who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = name;
+    var body = document.createElement('div');
+    body.className = 'body';
+    body.textContent = text;
+    div.appendChild(who);
+    div.appendChild(body);
     chatMessages.appendChild(div);
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 
   function showFloatingReaction(emoji) {
-    const el = document.createElement('div');
+    var el = document.createElement('div');
     el.textContent = emoji;
     el.style.cssText =
       'position:absolute;font-size:2rem;left:' +
       (20 + Math.random() * 60) +
       '%;bottom:20%;opacity:1;transition:all 2.2s ease-out;pointer-events:none;z-index:30;';
     floatingReactions.appendChild(el);
-    requestAnimationFrame(() => {
+    requestAnimationFrame(function () {
       el.style.bottom = '70%';
       el.style.opacity = '0';
       el.style.transform = 'scale(1.4)';
     });
-    setTimeout(() => el.remove(), 2300);
+    setTimeout(function () {
+      el.remove();
+    }, 2300);
   }
 
   async function toggleMic() {
     micEnabled = !micEnabled;
     applyMicCamState();
     if (audioProducer) {
-      if (micEnabled) {
-        await audioProducer.resume();
-        await request('resumeProducer', { producerId: audioProducer.id }).catch(() => {});
-      } else {
-        await audioProducer.pause();
-        await request('pauseProducer', { producerId: audioProducer.id }).catch(() => {});
+      try {
+        if (micEnabled) {
+          await audioProducer.resume();
+          await request('resumeProducer', { producerId: audioProducer.id }).catch(function () {});
+        } else {
+          await audioProducer.pause();
+          await request('pauseProducer', { producerId: audioProducer.id }).catch(function () {});
+        }
+      } catch (e) {
+        console.warn(e);
       }
     }
   }
@@ -632,14 +783,18 @@
     camEnabled = !camEnabled;
     applyMicCamState();
     if (videoProducer) {
-      if (camEnabled) {
-        await videoProducer.resume();
-        await request('resumeProducer', { producerId: videoProducer.id }).catch(() => {});
-      } else {
-        await videoProducer.pause();
-        await request('pauseProducer', { producerId: videoProducer.id }).catch(() => {});
+      try {
+        if (camEnabled) {
+          await videoProducer.resume();
+          await request('resumeProducer', { producerId: videoProducer.id }).catch(function () {});
+        } else {
+          await videoProducer.pause();
+          await request('pauseProducer', { producerId: videoProducer.id }).catch(function () {});
+        }
+      } catch (e) {
+        console.warn(e);
       }
-    } else if (camEnabled && localStream?.getVideoTracks().length && sendTransport) {
+    } else if (camEnabled && localStream && localStream.getVideoTracks().length && sendTransport) {
       videoProducer = await sendTransport.produce({
         track: localStream.getVideoTracks()[0],
         appData: { source: 'camera' },
@@ -648,19 +803,27 @@
   }
 
   async function toggleScreen() {
-    const btn = $('#toggle-screen');
+    var btn = $('#toggle-screen');
     if (screenProducer) {
       try {
         await request('closeProducer', { producerId: screenProducer.id });
-      } catch (_) {}
-      try { screenProducer.close(); } catch (_) {}
+      } catch (e) {}
+      try {
+        screenProducer.close();
+      } catch (e) {}
       screenProducer = null;
       if (screenStream) {
-        screenStream.getTracks().forEach((t) => t.stop());
+        screenStream.getTracks().forEach(function (t) {
+          t.stop();
+        });
         screenStream = null;
       }
-      btn?.classList.remove('active');
+      if (btn) btn.classList.remove('active');
       toast('Screen share stopped');
+      return;
+    }
+    if (!sendTransport) {
+      toast('Not connected');
       return;
     }
     try {
@@ -668,15 +831,15 @@
         video: { frameRate: 15 },
         audio: false,
       });
-      const track = screenStream.getVideoTracks()[0];
-      track.onended = () => {
+      var track = screenStream.getVideoTracks()[0];
+      track.onended = function () {
         if (screenProducer) toggleScreen();
       };
       screenProducer = await sendTransport.produce({
-        track,
+        track: track,
         appData: { source: 'screen' },
       });
-      btn?.classList.add('active');
+      if (btn) btn.classList.add('active');
       toast('Sharing screen');
     } catch (e) {
       if (e.name !== 'NotAllowedError') toast('Screen share failed');
@@ -685,7 +848,8 @@
 
   function toggleNoise() {
     noiseSuppression = !noiseSuppression;
-    $('#toggle-noise')?.classList.toggle('active', noiseSuppression);
+    var btn = $('#toggle-noise');
+    if (btn) btn.classList.toggle('active', noiseSuppression);
     toast(noiseSuppression ? 'Noise on (next device change)' : 'Noise off (next device change)');
   }
 
@@ -701,20 +865,21 @@
     recordedChunks = [];
     try {
       mediaRecorder = new MediaRecorder(localStream, { mimeType: 'video/webm;codecs=vp9,opus' });
-    } catch {
+    } catch (e) {
       mediaRecorder = new MediaRecorder(localStream);
     }
-    mediaRecorder.ondataavailable = (e) => {
+    mediaRecorder.ondataavailable = function (e) {
       if (e.data.size) recordedChunks.push(e.data);
     };
-    mediaRecorder.onstop = () => {
+    mediaRecorder.onstop = function () {
       recordingIndicator.classList.add('hidden');
-      $('#toggle-record')?.classList.remove('danger-active');
-      const blob = new Blob(recordedChunks, { type: 'video/webm' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
+      var rb = $('#toggle-record');
+      if (rb) rb.classList.remove('danger-active');
+      var blob = new Blob(recordedChunks, { type: 'video/webm' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
       a.href = url;
-      a.download = `room-${roomId}-${Date.now()}.webm`;
+      a.download = 'room-' + roomId + '-' + Date.now() + '.webm';
       a.click();
       URL.revokeObjectURL(url);
       toast('Recording saved');
@@ -722,33 +887,48 @@
     };
     mediaRecorder.start(1000);
     recordingIndicator.classList.remove('hidden');
-    $('#toggle-record')?.classList.add('danger-active');
+    var rb2 = $('#toggle-record');
+    if (rb2) rb2.classList.add('danger-active');
     toast('Recording…');
   }
 
   function startStats() {
     stopStats();
-    statsTimer = setInterval(async () => {
-      const lines = [];
+    statsTimer = setInterval(async function () {
+      var lines = [];
       try {
         if (sendTransport) {
-          (await sendTransport.getStats()).forEach((r) => {
+          (await sendTransport.getStats()).forEach(function (r) {
             if (r.type === 'outbound-rtp' && !r.isRemote) {
-              lines.push(`↑ ${r.kind}: ${Math.round((r.bytesSent || 0) / 1024)} KB`);
+              lines.push('↑ ' + r.kind + ': ' + Math.round((r.bytesSent || 0) / 1024) + ' KB');
             }
           });
         }
         if (recvTransport) {
-          (await recvTransport.getStats()).forEach((r) => {
+          (await recvTransport.getStats()).forEach(function (r) {
             if (r.type === 'inbound-rtp' && !r.isRemote) {
-              lines.push(`↓ ${r.kind}: ${Math.round((r.bytesReceived || 0) / 1024)} KB, lost ${r.packetsLost || 0}`);
+              lines.push(
+                '↓ ' +
+                  r.kind +
+                  ': ' +
+                  Math.round((r.bytesReceived || 0) / 1024) +
+                  ' KB, lost ' +
+                  (r.packetsLost || 0)
+              );
             }
           });
         }
-      } catch (_) {}
-      statsContent.innerHTML = lines.length
-        ? lines.map((l) => `<div>${escapeHtml(l)}</div>`).join('')
-        : '<p class="muted">Collecting…</p>';
+      } catch (e) {}
+      if (lines.length) {
+        statsContent.textContent = '';
+        lines.forEach(function (l) {
+          var d = document.createElement('div');
+          d.textContent = l;
+          statsContent.appendChild(d);
+        });
+      } else {
+        statsContent.innerHTML = '<p class="muted">Collecting…</p>';
+      }
     }, 2000);
   }
 
@@ -759,7 +939,7 @@
 
   function startPing() {
     stopPing();
-    pingTimer = setInterval(() => {
+    pingTimer = setInterval(function () {
       if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
     }, 25000);
   }
@@ -771,20 +951,23 @@
 
   async function loadDevices() {
     try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const fill = (sel, kind) => {
-        const prev = sel.value;
+      var devices = await navigator.mediaDevices.enumerateDevices();
+      function fill(sel, kind) {
+        if (!sel) return;
+        var prev = sel.value;
         sel.innerHTML = '';
         devices
-          .filter((d) => d.kind === kind)
-          .forEach((d) => {
-            const opt = document.createElement('option');
+          .filter(function (d) {
+            return d.kind === kind;
+          })
+          .forEach(function (d) {
+            var opt = document.createElement('option');
             opt.value = d.deviceId;
-            opt.textContent = d.label || `${kind} ${sel.options.length + 1}`;
+            opt.textContent = d.label || kind + ' ' + (sel.options.length + 1);
             sel.appendChild(opt);
           });
         if (prev) sel.value = prev;
-      };
+      }
       fill(selectCamera, 'videoinput');
       fill(selectMic, 'audioinput');
       fill(selectSpeaker, 'audiooutput');
@@ -795,10 +978,10 @@
 
   async function switchDevices() {
     if (!localStream || !sendTransport) return;
-    const videoId = selectCamera.value || undefined;
-    const audioId = selectMic.value || undefined;
+    var videoId = selectCamera && selectCamera.value;
+    var audioId = selectMic && selectMic.value;
     try {
-      const newStream = await navigator.mediaDevices.getUserMedia({
+      var constraints = {
         audio: {
           deviceId: audioId ? { exact: audioId } : undefined,
           echoCancellation: true,
@@ -812,14 +995,14 @@
               height: { ideal: 720 },
             }
           : false,
-      });
-
-      const newAudio = newStream.getAudioTracks()[0];
-      const newVideo = newStream.getVideoTracks()[0];
+      };
+      var newStream = await navigator.mediaDevices.getUserMedia(constraints);
+      var newAudio = newStream.getAudioTracks()[0];
+      var newVideo = newStream.getVideoTracks()[0];
 
       if (newAudio && audioProducer) {
         await audioProducer.replaceTrack({ track: newAudio });
-        localStream.getAudioTracks().forEach((t) => {
+        localStream.getAudioTracks().forEach(function (t) {
           localStream.removeTrack(t);
           t.stop();
         });
@@ -827,13 +1010,13 @@
       }
       if (newVideo && videoProducer) {
         await videoProducer.replaceTrack({ track: newVideo });
-        localStream.getVideoTracks().forEach((t) => {
+        localStream.getVideoTracks().forEach(function (t) {
           localStream.removeTrack(t);
           t.stop();
         });
         localStream.addTrack(newVideo);
       } else if (newVideo && !videoProducer && camEnabled) {
-        localStream.getVideoTracks().forEach((t) => {
+        localStream.getVideoTracks().forEach(function (t) {
           localStream.removeTrack(t);
           t.stop();
         });
@@ -848,7 +1031,6 @@
       applyMicCamState();
       startLocalMeter();
       applySpeaker();
-      toast('Devices updated');
     } catch (e) {
       console.error(e);
       toast('Could not switch device');
@@ -856,17 +1038,16 @@
   }
 
   async function applySettings() {
-    const newName = settingsName.value.trim().slice(0, 32);
+    var newName = (settingsName.value || '').trim().slice(0, 32);
     if (newName && newName !== displayName && peerId) {
       displayName = newName;
       localName.textContent = displayName;
-      await request('updateDisplayName', { displayName }).catch(() => {});
+      await request('updateDisplayName', { displayName: displayName }).catch(function () {});
       updateParticipants();
     }
     localVideo.classList.toggle('mirror', mirrorLocal.checked);
-    const sfu = settingsSfuUrl.value.trim();
+    var sfu = (settingsSfuUrl.value || '').trim();
     if (sfu) localStorage.setItem('sfuUrl', sfu.replace(/\/ws$/, ''));
-
     if (peerId) {
       await switchDevices();
       applySpeaker();
@@ -875,103 +1056,144 @@
     toast('Settings applied');
   }
 
-  joinForm.addEventListener('submit', (e) => {
+  joinForm.addEventListener('submit', function (e) {
     e.preventDefault();
     joinRoom(
-      displayNameInput.value.trim() || 'Guest',
-      roomIdInput.value.trim(),
-      roomPinInput?.value.trim() || ''
+      (displayNameInput.value || '').trim() || 'Guest',
+      (roomIdInput.value || '').trim(),
+      roomPinInput ? (roomPinInput.value || '').trim() : ''
     );
   });
 
-  $('#leave-btn')?.addEventListener('click', () => leaveRoom());
-  $('#toggle-mic')?.addEventListener('click', () => toggleMic());
-  $('#toggle-cam')?.addEventListener('click', () => toggleCam());
-  $('#toggle-screen')?.addEventListener('click', () => toggleScreen());
-  $('#toggle-noise')?.addEventListener('click', () => toggleNoise());
-  $('#toggle-record')?.addEventListener('click', () => toggleRecord());
-  $('#toggle-reactions')?.addEventListener('click', () => reactionsBar.classList.toggle('hidden'));
-  $('#toggle-participants')?.addEventListener('click', () => {
+  $('#leave-btn').addEventListener('click', function () {
+    leaveRoom(false);
+  });
+  $('#toggle-mic').addEventListener('click', function () {
+    toggleMic();
+  });
+  $('#toggle-cam').addEventListener('click', function () {
+    toggleCam();
+  });
+  $('#toggle-screen').addEventListener('click', function () {
+    toggleScreen();
+  });
+  $('#toggle-noise').addEventListener('click', function () {
+    toggleNoise();
+  });
+  $('#toggle-record').addEventListener('click', function () {
+    toggleRecord();
+  });
+  $('#toggle-reactions').addEventListener('click', function () {
+    reactionsBar.classList.toggle('hidden');
+  });
+  $('#toggle-participants').addEventListener('click', function () {
     $('#participants-panel').classList.toggle('hidden');
     $('#chat-panel').classList.add('hidden');
     $('#stats-panel').classList.add('hidden');
   });
-  $('#toggle-chat')?.addEventListener('click', () => {
+  $('#toggle-chat').addEventListener('click', function () {
     $('#chat-panel').classList.toggle('hidden');
     $('#participants-panel').classList.add('hidden');
     $('#stats-panel').classList.add('hidden');
   });
-  $('#toggle-stats')?.addEventListener('click', () => {
+  $('#toggle-stats').addEventListener('click', function () {
     $('#stats-panel').classList.toggle('hidden');
     $('#participants-panel').classList.add('hidden');
     $('#chat-panel').classList.add('hidden');
   });
-  $('#toggle-settings')?.addEventListener('click', () => {
+  $('#toggle-settings').addEventListener('click', function () {
     settingsName.value = displayName;
-    settingsSfuUrl.value = localStorage.getItem('sfuUrl') || defaultSfuUrl().replace(/\/ws$/, '');
+    settingsSfuUrl.value =
+      localStorage.getItem('sfuUrl') || defaultSfuUrl().replace(/\/ws$/, '');
     loadDevices();
     settingsModal.classList.remove('hidden');
   });
-  $('#close-settings')?.addEventListener('click', () => settingsModal.classList.add('hidden'));
-  $('#apply-settings')?.addEventListener('click', () => applySettings());
+  $('#close-settings').addEventListener('click', function () {
+    settingsModal.classList.add('hidden');
+  });
+  $('#apply-settings').addEventListener('click', function () {
+    applySettings();
+  });
 
-  $$('.close-panel').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const id = btn.dataset.panel;
-      if (id) $('#' + id)?.classList.add('hidden');
+  $$('.close-panel').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var id = btn.dataset.panel;
+      if (id) {
+        var el = $('#' + id);
+        if (el) el.classList.add('hidden');
+      }
     });
   });
 
-  reactionsBar?.addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-emoji]');
+  reactionsBar.addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-emoji]');
     if (!btn) return;
-    const emoji = btn.dataset.emoji;
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'reaction', emoji }));
+    var emoji = btn.dataset.emoji;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'reaction', emoji: emoji }));
     showFloatingReaction(emoji);
   });
 
-  chatForm?.addEventListener('submit', (e) => {
+  chatForm.addEventListener('submit', function (e) {
     e.preventDefault();
-    const text = chatInput.value.trim();
+    var text = (chatInput.value || '').trim();
     if (!text) return;
-    request('chat', { text }).catch(() => toast('Chat failed'));
+    if (!peerId) {
+      toast('Join a room first');
+      return;
+    }
+    request('chat', { text: text }).catch(function () {
+      toast('Chat failed');
+    });
     chatInput.value = '';
   });
 
-  $('#copy-room')?.addEventListener('click', () => {
-    navigator.clipboard.writeText(roomId || '').then(() => toast('Room ID copied'));
+  $('#copy-room').addEventListener('click', function () {
+    navigator.clipboard.writeText(roomId || '').then(function () {
+      toast('Room ID copied');
+    });
   });
-  $('#copy-invite')?.addEventListener('click', () => {
-    const u = new URL(location.href);
+  $('#copy-invite').addEventListener('click', function () {
+    var u = new URL(location.href);
     u.searchParams.set('room', roomId || '');
-    const sfu = localStorage.getItem('sfuUrl');
-    if (sfu) u.searchParams.set('sfu', sfu.includes('/ws') ? sfu : sfu + '/ws');
-    navigator.clipboard.writeText(u.toString()).then(() => toast('Invite link copied'));
+    var sfu = localStorage.getItem('sfuUrl');
+    if (sfu) u.searchParams.set('sfu', sfu.indexOf('/ws') !== -1 ? sfu : sfu + '/ws');
+    navigator.clipboard.writeText(u.toString()).then(function () {
+      toast('Invite link copied');
+    });
   });
 
-  document.addEventListener('keydown', (e) => {
+  document.addEventListener('keydown', function (e) {
     if (e.target.matches('input, textarea, select')) return;
     if (call.classList.contains('hidden')) return;
-    const k = e.key.toLowerCase();
+    var k = e.key.toLowerCase();
     if (k === 'm') toggleMic();
     else if (k === 'c') toggleCam();
     else if (k === 's' && !e.metaKey && !e.ctrlKey) toggleScreen();
     else if (k === 'escape') {
-      $$('.side-panel').forEach((p) => p.classList.add('hidden'));
+      $$('.side-panel').forEach(function (p) {
+        p.classList.add('hidden');
+      });
       reactionsBar.classList.add('hidden');
       settingsModal.classList.add('hidden');
     }
   });
 
-  const qRoom = qs('room');
-  const qName = qs('name');
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener('devicechange', function () {
+      loadDevices();
+    });
+  }
+
+  var qRoom = qs('room');
+  var qName = qs('name');
   if (qRoom) roomIdInput.value = qRoom;
   if (qName) displayNameInput.value = qName;
-  displayNameInput.value = displayNameInput.value || localStorage.getItem('displayName') || '';
-  displayNameInput.addEventListener('change', () => {
-    localStorage.setItem('displayName', displayNameInput.value.trim());
+  displayNameInput.value =
+    displayNameInput.value || localStorage.getItem('displayName') || '';
+  displayNameInput.addEventListener('change', function () {
+    localStorage.setItem('displayName', (displayNameInput.value || '').trim());
   });
 
-  $('#toggle-noise')?.classList.add('active');
+  $('#toggle-noise').classList.add('active');
   console.log('[WebRTC Room] client ready');
 })();
