@@ -1,6 +1,6 @@
 {
   "name": "webrtc-sfu-server",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,5 +11,7 @@
     "mediasoup": "^3.14.14",
     "ws": "^8.17.1"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }
