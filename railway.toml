@@ -1,0 +1,14 @@
+# Railway — deploy the SFU
+# https://railway.app  → New Project → Deploy from GitHub → this repo
+# Set variable: ANNOUNCED_IP=<your Railway public domain or IP>
+# Custom start: cd server && npm install && node server.js
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "cd server && npm install"
+
+[deploy]
+startCommand = "cd server && node server.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"

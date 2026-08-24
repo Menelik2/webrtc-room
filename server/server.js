@@ -17,9 +17,6 @@ const RTC_MIN_PORT = Number(process.env.MEDIASOUP_MIN_PORT) || 40000;
 const RTC_MAX_PORT = Number(process.env.MEDIASOUP_MAX_PORT) || 49999;
 const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS) || 12;
 
-// ---------------------------------------------------------------------------
-// mediasoup config
-// ---------------------------------------------------------------------------
 const mediaCodecs = [
   {
     kind: 'audio',
@@ -31,18 +28,13 @@ const mediaCodecs = [
     kind: 'video',
     mimeType: 'video/VP8',
     clockRate: 90000,
-    parameters: {
-      'x-google-start-bitrate': 1000,
-    },
+    parameters: { 'x-google-start-bitrate': 1000 },
   },
   {
     kind: 'video',
     mimeType: 'video/VP9',
     clockRate: 90000,
-    parameters: {
-      'profile-id': 2,
-      'x-google-start-bitrate': 1000,
-    },
+    parameters: { 'profile-id': 2, 'x-google-start-bitrate': 1000 },
   },
   {
     kind: 'video',
@@ -71,14 +63,9 @@ const webRtcTransportOptions = {
   maxIncomingBitrate: 3_000_000,
 };
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
 /** @type {import('mediasoup').types.Worker[]} */
 let workers = [];
 let nextWorkerIdx = 0;
-
-/** roomId -> Room */
 const rooms = new Map();
 
 function getNextWorker() {
@@ -92,16 +79,14 @@ class Peer {
     this.id = id;
     this.displayName = displayName || 'Guest';
     this.ws = ws;
-    this.transports = new Map(); // id -> WebRtcTransport
-    this.producers = new Map(); // id -> Producer
-    this.consumers = new Map(); // id -> Consumer
+    this.transports = new Map();
+    this.producers = new Map();
+    this.consumers = new Map();
     this.joinedAt = Date.now();
   }
 
   send(msg) {
-    if (this.ws.readyState === 1) {
-      this.ws.send(JSON.stringify(msg));
-    }
+    if (this.ws.readyState === 1) this.ws.send(JSON.stringify(msg));
   }
 
   close() {
@@ -124,7 +109,7 @@ class Room {
   constructor(id, router) {
     this.id = id;
     this.router = router;
-    this.peers = new Map(); // peerId -> Peer
+    this.peers = new Map();
   }
 
   get peerCount() {
@@ -172,14 +157,11 @@ async function getOrCreateRoom(roomId) {
   return room;
 }
 
-// ---------------------------------------------------------------------------
-// mediasoup workers
-// ---------------------------------------------------------------------------
 async function createWorkers() {
   const num = Math.max(1, Math.min(4, require('os').cpus().length));
   for (let i = 0; i < num; i++) {
     const worker = await mediasoup.createWorker({
-      logLevel: 'warn',
+      logLevel: process.env.MEDIASOUP_LOG_LEVEL || 'warn',
       logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'],
       rtcMinPort: RTC_MIN_PORT,
       rtcMaxPort: RTC_MAX_PORT,
@@ -193,9 +175,6 @@ async function createWorkers() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Signaling helpers
-// ---------------------------------------------------------------------------
 function genId(prefix = '') {
   return prefix + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 }
@@ -206,9 +185,6 @@ function safeRoomId(raw) {
   return cleaned || genId('r');
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket handler
-// ---------------------------------------------------------------------------
 function attachWs(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -238,11 +214,8 @@ function attachWs(server) {
 
       try {
         switch (type) {
-          // -------- join --------
           case 'join': {
-            if (peer) {
-              return reply({ type: 'error', error: 'already_joined' });
-            }
+            if (peer) return reply({ type: 'error', error: 'already_joined' });
             const roomId = safeRoomId(data.roomId);
             const displayName = String(data.displayName || 'Guest').slice(0, 32);
 
@@ -254,7 +227,6 @@ function attachWs(server) {
             peer = new Peer(peerId, displayName, ws);
             room.peers.set(peerId, peer);
 
-            // Existing producers for the new peer
             const existingProducers = [];
             for (const [otherId, other] of room.peers) {
               if (otherId === peerId) continue;
@@ -290,7 +262,6 @@ function attachWs(server) {
             break;
           }
 
-          // -------- create transport --------
           case 'createWebRtcTransport': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
 
@@ -318,7 +289,6 @@ function attachWs(server) {
             break;
           }
 
-          // -------- connect transport --------
           case 'connectWebRtcTransport': {
             if (!peer) return reply({ type: 'error', error: 'not_joined' });
             const transport = peer.transports.get(data.transportId);
@@ -328,7 +298,6 @@ function attachWs(server) {
             break;
           }
 
-          // -------- produce --------
           case 'produce': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
             const transport = peer.transports.get(data.transportId);
@@ -341,7 +310,6 @@ function attachWs(server) {
             });
 
             peer.producers.set(producer.id, producer);
-
             producer.on('transportclose', () => {
               peer?.producers.delete(producer.id);
             });
@@ -362,11 +330,9 @@ function attachWs(server) {
             break;
           }
 
-          // -------- consume --------
           case 'consume': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
 
-            // Find producer across peers
             let targetProducer = null;
             let producerPeerId = null;
             for (const [oid, other] of room.peers) {
@@ -389,15 +355,18 @@ function attachWs(server) {
             const consumer = await transport.consume({
               producerId: targetProducer.id,
               rtpCapabilities: data.rtpCapabilities,
-              paused: true, // client resumes after setup
+              paused: true,
             });
 
             peer.consumers.set(consumer.id, consumer);
-
             consumer.on('transportclose', () => peer?.consumers.delete(consumer.id));
             consumer.on('producerclose', () => {
               peer?.consumers.delete(consumer.id);
-              peer?.send({ type: 'consumerClosed', consumerId: consumer.id, producerId: targetProducer.id });
+              peer?.send({
+                type: 'consumerClosed',
+                consumerId: consumer.id,
+                producerId: targetProducer.id,
+              });
             });
 
             reply({
@@ -413,7 +382,6 @@ function attachWs(server) {
             break;
           }
 
-          // -------- resume consumer --------
           case 'resumeConsumer': {
             if (!peer) return reply({ type: 'error', error: 'not_joined' });
             const consumer = peer.consumers.get(data.consumerId);
@@ -423,7 +391,6 @@ function attachWs(server) {
             break;
           }
 
-          // -------- pause / resume producer --------
           case 'pauseProducer': {
             if (!peer) return reply({ type: 'error', error: 'not_joined' });
             const producer = peer.producers.get(data.producerId);
@@ -444,7 +411,6 @@ function attachWs(server) {
             break;
           }
 
-          // -------- close producer (e.g. stop screen) --------
           case 'closeProducer': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
             const producer = peer.producers.get(data.producerId);
@@ -460,24 +426,21 @@ function attachWs(server) {
             break;
           }
 
-          // -------- chat --------
           case 'chat': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
             const text = String(data.text || '').slice(0, 500).trim();
             if (!text) return reply({ type: 'error', error: 'empty' });
-            const msg = {
+            room.broadcast({
               type: 'chat',
               peerId: peer.id,
               displayName: peer.displayName,
               text,
               ts: Date.now(),
-            };
-            room.broadcast(msg); // include sender so everyone sees it the same way
+            });
             reply({ type: 'ok' });
             break;
           }
 
-          // -------- reaction --------
           case 'reaction': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
             const emoji = String(data.emoji || '').slice(0, 8);
@@ -493,7 +456,6 @@ function attachWs(server) {
             break;
           }
 
-          // -------- rename --------
           case 'updateDisplayName': {
             if (!peer || !room) return reply({ type: 'error', error: 'not_joined' });
             peer.displayName = String(data.displayName || 'Guest').slice(0, 32);
@@ -506,14 +468,12 @@ function attachWs(server) {
             break;
           }
 
-          // -------- leave --------
           case 'leave': {
             cleanup();
             reply({ type: 'left' });
             break;
           }
 
-          // -------- ping --------
           case 'ping': {
             reply({ type: 'pong', t: Date.now() });
             break;
@@ -534,7 +494,6 @@ function attachWs(server) {
       const name = peer.displayName;
       const pid = peer.id;
 
-      // Notify others about closed producers
       for (const prod of peer.producers.values()) {
         room.broadcast({ type: 'producerClosed', peerId: pid, producerId: prod.id }, pid);
       }
@@ -561,28 +520,32 @@ function attachWs(server) {
   return wss;
 }
 
-// ---------------------------------------------------------------------------
-// HTTP + static
-// ---------------------------------------------------------------------------
 async function main() {
   await createWorkers();
 
   const app = express();
+  app.set('trust proxy', 1);
   app.disable('x-powered-by');
 
-  // Health
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
+
   app.get('/health', (_req, res) => {
     res.json({
       ok: true,
       rooms: rooms.size,
       peers: [...rooms.values()].reduce((n, r) => n + r.peerCount, 0),
       workers: workers.length,
+      announcedIp: ANNOUNCED_IP || null,
+      uptime: Math.round(process.uptime()),
     });
   });
 
-  // Serve client
   const clientDir = path.join(__dirname, '..', 'client');
-  app.use(express.static(clientDir, { index: 'index.html', maxAge: '1h' }));
+  app.use(express.static(clientDir, { index: 'index.html', maxAge: '1h', etag: true }));
   app.get('*', (_req, res) => {
     res.sendFile(path.join(clientDir, 'index.html'));
   });
@@ -591,11 +554,26 @@ async function main() {
   attachWs(server);
 
   server.listen(PORT, () => {
-    console.log(`\n  WebRTC Room SFU listening on http://0.0.0.0:${PORT}`);
-    console.log(`  WS path: /ws`);
-    if (ANNOUNCED_IP) console.log(`  Announced IP: ${ANNOUNCED_IP}`);
-    console.log(`  RTC ports: ${RTC_MIN_PORT}-${RTC_MAX_PORT}\n`);
+    console.log(`\n  WebRTC Room SFU  http://0.0.0.0:${PORT}`);
+    console.log(`  WebSocket         /ws`);
+    console.log(`  Health            /health`);
+    if (ANNOUNCED_IP) console.log(`  Announced IP      ${ANNOUNCED_IP}`);
+    else console.log(`  Announced IP      (none — set ANNOUNCED_IP for cloud/NAT)`);
+    console.log(`  RTC ports         ${RTC_MIN_PORT}-${RTC_MAX_PORT}\n`);
   });
+
+  const shutdown = () => {
+    console.log('\nShutting down…');
+    server.close(() => {
+      for (const w of workers) {
+        try { w.close(); } catch (_) {}
+      }
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 5000);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 main().catch((err) => {

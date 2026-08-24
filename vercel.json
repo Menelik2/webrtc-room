@@ -1,6 +1,7 @@
 {
   "version": 2,
-  "buildCommand": "node scripts/validate.js || true",
+  "buildCommand": null,
   "outputDirectory": "client",
-  "installCommand": "npm install --ignore-scripts || true"
+  "installCommand": null,
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }

@@ -1,0 +1,29 @@
+# Fly.io — https://fly.io
+# fly launch  (or fly apps create webrtc-room)
+# fly secrets set ANNOUNCED_IP=<your-app>.fly.dev
+# fly deploy
+
+app = "webrtc-room"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "3000"
+  MEDIASOUP_MIN_PORT = "40000"
+  MEDIASOUP_MAX_PORT = "40100"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[services]]
+  protocol = "udp"
+  internal_port = 40000
+
+  [[services.ports]]
+    port = 40000

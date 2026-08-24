@@ -6,15 +6,16 @@ Professional multi-party **voice, video, and screen-sharing** rooms powered by a
 
 ## Features
 
-- Multi-party **SFU** (not mesh) — better scale than pure P2P
+- Multi-party **SFU** (not mesh)
 - Camera + microphone with mute / pause
 - Screen sharing
 - Live chat & emoji reactions
-- Participants list & basic WebRTC stats
-- Device selection (camera / mic / speaker)
-- Local recording (WebM download)
-- Invite links with room ID + optional remote SFU URL
-- Vercel-ready static client; SFU on any Node host or Docker
+- Participants list & WebRTC stats
+- Device selection
+- Local recording (WebM)
+- Invite links (`?room=` + optional `?sfu=`)
+- Docker + Railway / Render / Fly configs
+- Vercel-ready static client
 
 ## Quick start (local)
 
@@ -23,77 +24,73 @@ cd server && npm install && cd ..
 npm start
 ```
 
-Open **http://localhost:3000** — join the same room ID from two browsers to test.
+Open **http://localhost:3000** — use the same room ID in two browsers.
 
-## Environment variables
+## Environment
 
 See [`.env.example`](.env.example).
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3000` | HTTP + WebSocket port |
-| `ANNOUNCED_IP` | — | Public IP/hostname for ICE (**required** behind NAT / cloud) |
-| `MEDIASOUP_LISTEN_IP` | `0.0.0.0` | RTC bind address |
-| `MEDIASOUP_MIN_PORT` | `40000` | RTC port range start |
-| `MEDIASOUP_MAX_PORT` | `49999` | RTC port range end |
-| `MAX_PEERS` | `12` | Max peers per room |
+| Variable | Default | Notes |
+|----------|---------|--------|
+| `PORT` | `3000` | HTTP + WS |
+| `ANNOUNCED_IP` | — | **Required** on cloud/NAT (public IP or hostname) |
+| `MEDIASOUP_MIN_PORT` / `MAX` | `40000` / `49999` | Open UDP+TCP in firewall |
+| `MAX_PEERS` | `12` | Per room |
 
-```bash
-export ANNOUNCED_IP=203.0.113.10
-cd server && npm start
-```
+## Deploy SFU
 
-Open firewall: TCP `PORT`, and UDP+TCP `40000–49999` (or your configured range).
-
-## Docker
+### Docker
 
 ```bash
 docker build -t webrtc-room .
 docker run --rm -p 3000:3000 -p 40000-40100:40000-40100/udp -p 40000-40100:40000-40100/tcp \
-  -e ANNOUNCED_IP=YOUR_PUBLIC_IP \
-  webrtc-room
+  -e ANNOUNCED_IP=YOUR_PUBLIC_IP webrtc-room
 ```
 
-## Vercel (client only)
+### Railway
 
-The **SFU cannot run on Vercel**. Deploy the static UI from `client/` (`vercel.json` is configured). Host `server/` on Railway, Render, Fly.io, a VPS, or Docker.
+1. New project → Deploy from GitHub → `Menelik2/webrtc-room`
+2. Use `railway.toml` (or set start: `cd server && npm install && node server.js`)
+3. Set `ANNOUNCED_IP` to the public hostname Railway gives you
+4. Health check: `/health`
 
-Remote join:
+### Render
+
+Use [`render.yaml`](render.yaml) blueprint, then set `ANNOUNCED_IP` to `your-service.onrender.com`.
+
+> Free/web plans may not expose the mediasoup UDP range well. Prefer a VPS or Docker host with open RTC ports for production video.
+
+### Fly.io
+
+```bash
+fly launch
+fly secrets set ANNOUNCED_IP=YOUR_APP.fly.dev
+fly deploy
+```
+
+## Deploy client (Vercel)
+
+`vercel.json` serves `client/` as static. The SFU must run elsewhere.
+
+Join remotely:
 
 ```
 https://YOUR.vercel.app/?room=standup&sfu=wss://YOUR-SFU-HOST/ws
 ```
 
-Or set the SFU URL under **Settings** in the app (stored in `localStorage`).
-
 ## Project layout
 
 ```
-webrtc-room/
-├── client/           # Static UI (HTML/CSS/JS + mediasoup-client)
-├── server/           # Express + WS + mediasoup SFU
-├── scripts/validate.js
-├── Dockerfile
-├── vercel.json
-└── README.md
+client/     UI (HTML/CSS/JS + mediasoup-client CDN)
+server/     Express + WS + mediasoup
+scripts/    validate.js
+Dockerfile  railway.toml  render.yaml  fly.toml
 ```
 
-## Signaling (WebSocket `/ws`)
+## API
 
-JSON messages; client requests include `requestId` for matched replies.
-
-| Client → Server | Server → Client |
-|-----------------|-----------------|
-| `join` | `joined`, `peerJoined` |
-| `createWebRtcTransport` | `webRtcTransportCreated` |
-| `connectWebRtcTransport` | `webRtcTransportConnected` |
-| `produce` | `produced`, `newProducer` |
-| `consume` / `resumeConsumer` | `consumed` / `consumerResumed` |
-| `pauseProducer` / `resumeProducer` / `closeProducer` | `producerPaused` / `producerResumed` / `producerClosed` |
-| `chat` / `reaction` | `chat` / `reaction` |
-| `leave` | `peerLeft` |
-
-Health: `GET /health`
+- `GET /health` — rooms, peers, workers, uptime
+- `WS /ws` — signaling (join, transports, produce/consume, chat, reactions)
 
 ## License
 
