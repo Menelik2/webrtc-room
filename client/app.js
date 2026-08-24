@@ -1,15 +1,13 @@
 /**
  * WebRTC Room — client (mediasoup-client)
- * Full lobby, media, screen share, chat, reactions, participants, stats, settings
  */
 (() => {
   'use strict';
 
   const { Device } = window.mediasoupClient || {};
   if (!Device) {
-    console.error('mediasoup-client failed to load');
     document.body.innerHTML =
-      '<p style="color:#fff;padding:2rem;font-family:system-ui">Failed to load mediasoup-client. Check network / CDN.</p>';
+      '<p style="color:#fff;padding:2rem;font-family:system-ui">Failed to load mediasoup-client.</p>';
     return;
   }
 
@@ -21,6 +19,7 @@
   const joinForm = $('#join-form');
   const displayNameInput = $('#display-name');
   const roomIdInput = $('#room-id');
+  const roomPinInput = $('#room-pin');
   const joinBtn = $('#join-btn');
   const currentRoomEl = $('#current-room');
   const peerCountEl = $('#peer-count');
@@ -69,7 +68,6 @@
   const peers = new Map();
   const consumers = new Map();
   const producerToConsumer = new Map();
-
   let requestSeq = 0;
   const pending = new Map();
 
@@ -87,6 +85,14 @@
 
   function qs(name) {
     return new URLSearchParams(location.search).get(name);
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&')
+      .replace(/</g, '<')
+      .replace(/>/g, '>')
+      .replace(/"/g, '"');
   }
 
   function defaultSfuUrl() {
@@ -123,7 +129,6 @@
       else resolve(msg);
       return;
     }
-
     switch (msg.type) {
       case 'peerJoined':
         ensurePeer(msg.peer.id, msg.peer.displayName);
@@ -154,10 +159,10 @@
         closeConsumer(msg.consumerId);
         break;
       case 'chat':
-        appendChat(msg.displayName, msg.text, msg.peerId === peerId);
+        appendChat(msg.displayName, msg.text);
         break;
       case 'reaction':
-        showFloatingReaction(msg.emoji, msg.displayName);
+        showFloatingReaction(msg.emoji);
         break;
       default:
         break;
@@ -171,7 +176,6 @@
         socket.close();
         reject(new Error('WebSocket connect timeout'));
       }, 10000);
-
       socket.onopen = () => {
         clearTimeout(t);
         ws = socket;
@@ -198,24 +202,38 @@
     });
   }
 
-  async function getLocalMedia() {
-    const constraints = {
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: noiseSuppression,
-        autoGainControl: true,
-      },
-      video: {
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30 },
-      },
-    };
+  async function getLocalMedia(deviceIds = {}) {
+    const audio =
+      deviceIds.audioId != null
+        ? {
+            deviceId: { exact: deviceIds.audioId },
+            echoCancellation: true,
+            noiseSuppression: noiseSuppression,
+            autoGainControl: true,
+          }
+        : {
+            echoCancellation: true,
+            noiseSuppression: noiseSuppression,
+            autoGainControl: true,
+          };
+    const video =
+      deviceIds.videoId != null
+        ? {
+            deviceId: { exact: deviceIds.videoId },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 },
+          }
+        : {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 },
+          };
     try {
-      localStream = await navigator.mediaDevices.getUserMedia(constraints);
+      localStream = await navigator.mediaDevices.getUserMedia({ audio, video });
     } catch (e) {
-      console.warn('Cam failed, trying audio only', e);
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: constraints.audio });
+      console.warn('Cam failed, audio only', e);
+      localStream = await navigator.mediaDevices.getUserMedia({ audio });
       camEnabled = false;
     }
     localVideo.srcObject = localStream;
@@ -252,8 +270,7 @@
         analyser.getByteFrequencyData(data);
         let sum = 0;
         for (let i = 0; i < data.length; i++) sum += data[i];
-        const avg = sum / data.length / 255;
-        bar.style.height = Math.min(100, Math.round(avg * 140)) + '%';
+        bar.style.height = Math.min(100, Math.round((sum / data.length / 255) * 140)) + '%';
       }, 80);
     } catch (_) {}
   }
@@ -263,26 +280,25 @@
     meterTimer = null;
   }
 
-  async function joinRoom(name, rid) {
+  async function joinRoom(name, rid, pin) {
     joinBtn.disabled = true;
     joinBtn.textContent = 'Connecting…';
-
     try {
       displayName = name;
       roomId = rid || genRoomId();
 
       let sfuUrl = settingsSfuUrl.value.trim() || defaultSfuUrl();
-      if (!sfuUrl) {
-        throw new Error('SFU URL required. Set it in Settings or use ?sfu=wss://host/ws');
-      }
-      if (!sfuUrl.includes('/ws')) {
-        sfuUrl = sfuUrl.replace(/\/?$/, '') + '/ws';
-      }
+      if (!sfuUrl) throw new Error('SFU URL required');
+      if (!sfuUrl.includes('/ws')) sfuUrl = sfuUrl.replace(/\/?$/, '') + '/ws';
       localStorage.setItem('sfuUrl', sfuUrl.replace(/\/ws$/, ''));
 
       await connectWs(sfuUrl);
 
-      const joined = await request('join', { roomId, displayName: name });
+      const joined = await request('join', {
+        roomId,
+        displayName: name,
+        pin: pin || undefined,
+      });
 
       peerId = joined.peerId;
       roomId = joined.roomId;
@@ -293,7 +309,6 @@
 
       sendTransport = await createTransport('send');
       recvTransport = await createTransport('recv');
-
       await getLocalMedia();
 
       if (localStream.getAudioTracks().length) {
@@ -332,11 +347,16 @@
       const u = new URL(location.href);
       u.searchParams.set('room', roomId);
       history.replaceState(null, '', u);
-
-      toast(`Joined room ${roomId}`);
+      toast(`Joined room ${roomId}${joined.hasPin ? ' (PIN)' : ''}`);
     } catch (err) {
       console.error(err);
-      toast(err.message || 'Join failed');
+      const msg =
+        err.message === 'invalid_pin'
+          ? 'Wrong room PIN'
+          : err.message === 'room_full'
+            ? 'Room is full'
+            : err.message || 'Join failed';
+      toast(msg);
       cleanupMedia();
       if (ws) {
         try { ws.close(); } catch (_) {}
@@ -356,10 +376,7 @@
         : device.createRecvTransport(info);
 
     transport.on('connect', ({ dtlsParameters }, callback, errback) => {
-      request('connectWebRtcTransport', {
-        transportId: transport.id,
-        dtlsParameters,
-      })
+      request('connectWebRtcTransport', { transportId: transport.id, dtlsParameters })
         .then(() => callback())
         .catch(errback);
     });
@@ -381,45 +398,35 @@
     }
 
     transport.on('connectionstatechange', (state) => {
-      if (state === 'failed' || state === 'closed') {
-        console.warn(`Transport ${direction} state:`, state);
-      }
+      if (state === 'failed' || state === 'closed') console.warn(`Transport ${direction}:`, state);
     });
-
     return transport;
   }
 
   async function consumeProducer(producerId, remotePeerId, remoteName, kind, appData = {}) {
     if (!device || !recvTransport) return;
     if (producerToConsumer.has(producerId)) return;
-
     ensurePeer(remotePeerId, remoteName);
-
     try {
       const consumed = await request('consume', {
         transportId: recvTransport.id,
         producerId,
         rtpCapabilities: device.rtpCapabilities,
       });
-
       const consumer = await recvTransport.consume({
         id: consumed.id,
         producerId: consumed.producerId,
         kind: consumed.kind,
         rtpParameters: consumed.rtpParameters,
       });
-
       consumers.set(consumer.id, consumer);
       producerToConsumer.set(producerId, consumer.id);
-
       const peer = peers.get(remotePeerId);
       if (peer) peer.consumers.set(consumer.id, consumer);
-
-      const source = (appData && appData.source) || kind;
-      attachRemoteTrack(remotePeerId, remoteName, consumer.track, source);
-
+      attachRemoteTrack(remotePeerId, remoteName, consumer.track, (appData && appData.source) || kind);
       await request('resumeConsumer', { consumerId: consumer.id });
       updateParticipants();
+      applySpeaker();
     } catch (err) {
       console.error('consume failed', producerId, err);
     }
@@ -427,49 +434,47 @@
 
   function ensurePeer(id, name) {
     if (!peers.has(id)) {
-      peers.set(id, {
-        displayName: name || 'Guest',
-        tiles: new Map(),
-        consumers: new Map(),
-      });
-    } else if (name) {
-      peers.get(id).displayName = name;
-    }
+      peers.set(id, { displayName: name || 'Guest', tiles: new Map(), consumers: new Map() });
+    } else if (name) peers.get(id).displayName = name;
   }
 
   function attachRemoteTrack(remotePeerId, remoteName, track, source) {
     const peer = peers.get(remotePeerId);
     if (!peer) return;
-
     let tile = peer.tiles.get(source);
     if (!tile) {
       tile = document.createElement('div');
       tile.className = 'video-tile remote';
       tile.dataset.peerId = remotePeerId;
       tile.dataset.source = source;
-      tile.innerHTML = `
-        <video autoplay playsinline></video>
-        <div class="tile-overlay">
-          <div class="tile-label">
-            <span class="remote-name">${escapeHtml(remoteName)}</span>
-            <span class="source-badge">${source === 'screen' ? '🖥️' : ''}</span>
-          </div>
-        </div>`;
+      tile.innerHTML = `<video autoplay playsinline></video>
+        <div class="tile-overlay"><div class="tile-label">
+          <span class="remote-name">${escapeHtml(remoteName)}</span>
+          <span class="source-badge">${source === 'screen' ? '🖥️' : ''}</span>
+        </div></div>`;
       videosGrid.appendChild(tile);
       peer.tiles.set(source, tile);
     }
-
     const video = tile.querySelector('video');
     let stream = video.srcObject;
     if (!stream) {
       stream = new MediaStream();
       video.srcObject = stream;
     }
-    stream.getTracks().filter((t) => t.kind === track.kind).forEach((t) => {
-      stream.removeTrack(t);
-    });
+    stream.getTracks().filter((t) => t.kind === track.kind).forEach((t) => stream.removeTrack(t));
     stream.addTrack(track);
     video.play().catch(() => {});
+    applySpeaker();
+  }
+
+  function applySpeaker() {
+    const id = selectSpeaker?.value;
+    if (!id) return;
+    $$('.video-tile video').forEach((v) => {
+      if (typeof v.setSinkId === 'function') {
+        v.setSinkId(id).catch(() => {});
+      }
+    });
   }
 
   function updatePeerLabels(id) {
@@ -492,18 +497,13 @@
     if (!consumer) return;
     try { consumer.close(); } catch (_) {}
     consumers.delete(consumerId);
-
     for (const peer of peers.values()) {
       peer.consumers.delete(consumerId);
       for (const [source, tile] of [...peer.tiles]) {
-        const video = tile.querySelector('video');
-        const stream = video?.srcObject;
-        if (stream) {
-          const live = stream.getTracks().filter((t) => t.readyState === 'live');
-          if (live.length === 0) {
-            tile.remove();
-            peer.tiles.delete(source);
-          }
+        const stream = tile.querySelector('video')?.srcObject;
+        if (stream && stream.getTracks().filter((t) => t.readyState === 'live').length === 0) {
+          tile.remove();
+          peer.tiles.delete(source);
         }
       }
     }
@@ -530,27 +530,22 @@
     mediaRecorder = null;
     recordedChunks = [];
     recordingIndicator.classList.add('hidden');
-
     [audioProducer, videoProducer, screenProducer].forEach((p) => {
       try { p?.close(); } catch (_) {}
     });
     audioProducer = videoProducer = screenProducer = null;
-
     try { sendTransport?.close(); } catch (_) {}
     try { recvTransport?.close(); } catch (_) {}
     sendTransport = recvTransport = null;
-
     for (const c of consumers.values()) {
       try { c.close(); } catch (_) {}
     }
     consumers.clear();
     producerToConsumer.clear();
-
     for (const peer of peers.values()) {
       for (const tile of peer.tiles.values()) tile.remove();
     }
     peers.clear();
-
     if (localStream) {
       localStream.getTracks().forEach((t) => t.stop());
       localStream = null;
@@ -565,9 +560,7 @@
 
   function leaveRoom(fromClose = false) {
     if (!fromClose && ws && ws.readyState === 1) {
-      try {
-        ws.send(JSON.stringify({ type: 'leave' }));
-      } catch (_) {}
+      try { ws.send(JSON.stringify({ type: 'leave' })); } catch (_) {}
     }
     cleanupMedia();
     if (ws) {
@@ -579,14 +572,7 @@
     lobby.classList.remove('hidden');
     $$('.side-panel').forEach((p) => p.classList.add('hidden'));
     reactionsBar.classList.add('hidden');
-  }
-
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, '&')
-      .replace(/</g, '<')
-      .replace(/>/g, '>')
-      .replace(/"/g, '"');
+    settingsModal.classList.add('hidden');
   }
 
   function updatePeerCount() {
@@ -700,7 +686,7 @@
   function toggleNoise() {
     noiseSuppression = !noiseSuppression;
     $('#toggle-noise')?.classList.toggle('active', noiseSuppression);
-    toast(noiseSuppression ? 'Noise suppression on (applies next join)' : 'Noise suppression off (applies next join)');
+    toast(noiseSuppression ? 'Noise on (next device change)' : 'Noise off (next device change)');
   }
 
   function toggleRecord() {
@@ -743,26 +729,19 @@
   function startStats() {
     stopStats();
     statsTimer = setInterval(async () => {
-      if (!sendTransport && !recvTransport) return;
       const lines = [];
       try {
         if (sendTransport) {
-          const st = await sendTransport.getStats();
-          st.forEach((r) => {
+          (await sendTransport.getStats()).forEach((r) => {
             if (r.type === 'outbound-rtp' && !r.isRemote) {
-              lines.push(
-                `↑ ${r.kind}: ${Math.round((r.bytesSent || 0) / 1024)} KB`
-              );
+              lines.push(`↑ ${r.kind}: ${Math.round((r.bytesSent || 0) / 1024)} KB`);
             }
           });
         }
         if (recvTransport) {
-          const st = await recvTransport.getStats();
-          st.forEach((r) => {
+          (await recvTransport.getStats()).forEach((r) => {
             if (r.type === 'inbound-rtp' && !r.isRemote) {
-              lines.push(
-                `↓ ${r.kind}: ${Math.round((r.bytesReceived || 0) / 1024)} KB, lost ${r.packetsLost || 0}`
-              );
+              lines.push(`↓ ${r.kind}: ${Math.round((r.bytesReceived || 0) / 1024)} KB, lost ${r.packetsLost || 0}`);
             }
           });
         }
@@ -794,6 +773,7 @@
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       const fill = (sel, kind) => {
+        const prev = sel.value;
         sel.innerHTML = '';
         devices
           .filter((d) => d.kind === kind)
@@ -803,12 +783,75 @@
             opt.textContent = d.label || `${kind} ${sel.options.length + 1}`;
             sel.appendChild(opt);
           });
+        if (prev) sel.value = prev;
       };
       fill(selectCamera, 'videoinput');
       fill(selectMic, 'audioinput');
       fill(selectSpeaker, 'audiooutput');
     } catch (e) {
       console.warn(e);
+    }
+  }
+
+  async function switchDevices() {
+    if (!localStream || !sendTransport) return;
+    const videoId = selectCamera.value || undefined;
+    const audioId = selectMic.value || undefined;
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: audioId ? { exact: audioId } : undefined,
+          echoCancellation: true,
+          noiseSuppression: noiseSuppression,
+          autoGainControl: true,
+        },
+        video: camEnabled
+          ? {
+              deviceId: videoId ? { exact: videoId } : undefined,
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            }
+          : false,
+      });
+
+      const newAudio = newStream.getAudioTracks()[0];
+      const newVideo = newStream.getVideoTracks()[0];
+
+      if (newAudio && audioProducer) {
+        await audioProducer.replaceTrack({ track: newAudio });
+        localStream.getAudioTracks().forEach((t) => {
+          localStream.removeTrack(t);
+          t.stop();
+        });
+        localStream.addTrack(newAudio);
+      }
+      if (newVideo && videoProducer) {
+        await videoProducer.replaceTrack({ track: newVideo });
+        localStream.getVideoTracks().forEach((t) => {
+          localStream.removeTrack(t);
+          t.stop();
+        });
+        localStream.addTrack(newVideo);
+      } else if (newVideo && !videoProducer && camEnabled) {
+        localStream.getVideoTracks().forEach((t) => {
+          localStream.removeTrack(t);
+          t.stop();
+        });
+        localStream.addTrack(newVideo);
+        videoProducer = await sendTransport.produce({
+          track: newVideo,
+          appData: { source: 'camera' },
+        });
+      }
+
+      localVideo.srcObject = localStream;
+      applyMicCamState();
+      startLocalMeter();
+      applySpeaker();
+      toast('Devices updated');
+    } catch (e) {
+      console.error(e);
+      toast('Could not switch device');
     }
   }
 
@@ -823,13 +866,22 @@
     localVideo.classList.toggle('mirror', mirrorLocal.checked);
     const sfu = settingsSfuUrl.value.trim();
     if (sfu) localStorage.setItem('sfuUrl', sfu.replace(/\/ws$/, ''));
+
+    if (peerId) {
+      await switchDevices();
+      applySpeaker();
+    }
     settingsModal.classList.add('hidden');
     toast('Settings applied');
   }
 
   joinForm.addEventListener('submit', (e) => {
     e.preventDefault();
-    joinRoom(displayNameInput.value.trim() || 'Guest', roomIdInput.value.trim());
+    joinRoom(
+      displayNameInput.value.trim() || 'Guest',
+      roomIdInput.value.trim(),
+      roomPinInput?.value.trim() || ''
+    );
   });
 
   $('#leave-btn')?.addEventListener('click', () => leaveRoom());
@@ -895,6 +947,20 @@
     const sfu = localStorage.getItem('sfuUrl');
     if (sfu) u.searchParams.set('sfu', sfu.includes('/ws') ? sfu : sfu + '/ws');
     navigator.clipboard.writeText(u.toString()).then(() => toast('Invite link copied'));
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target.matches('input, textarea, select')) return;
+    if (call.classList.contains('hidden')) return;
+    const k = e.key.toLowerCase();
+    if (k === 'm') toggleMic();
+    else if (k === 'c') toggleCam();
+    else if (k === 's' && !e.metaKey && !e.ctrlKey) toggleScreen();
+    else if (k === 'escape') {
+      $$('.side-panel').forEach((p) => p.classList.add('hidden'));
+      reactionsBar.classList.add('hidden');
+      settingsModal.classList.add('hidden');
+    }
   });
 
   const qRoom = qs('room');
